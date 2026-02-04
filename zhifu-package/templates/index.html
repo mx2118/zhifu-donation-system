@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title> 功德榜</title>
+    <link href="/static/combined.min.css" rel="stylesheet">
+</head>
+<body>
+    <!-- 默认图片容器 -->
+    <div id="default-image-container" class="default-image-container" style="display: none;">
+        <div style="display: flex; flex-direction: column; align-items: center; justify-content: center;">
+            <img src="/static/index.png" alt="默认图片">
+            <div style="margin-top: 20px; font-size: 18px; font-weight: bold; text-align: center;">乘风不问鲲鹏路，独与天地共悠然。</div>
+            <div style="margin-top: 10px; font-size: 16px; text-align: center;">Copyright © 2026 All Rights Reserved.</div>
+        </div>
+    </div>
+    
+    <!-- 顶部导航栏 -->
+    <div class="top-nav">
+        <div class="top-nav-content">
+            <div class="nav-left">
+                
+            </div>
+            <div class="nav-right">
+                <!-- 做功德按钮 -->
+                <button id="merit-btn" class="merit-btn">+ 做功德</button>
+                <!-- 下拉式导航 -->
+                <div class="dropdown">
+                    <button class="dropdown-btn">栏目列表</button>
+                    <div class="dropdown-content">
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- 模态窗口 -->
+    <div id="merit-modal">
+        <div>
+            <button id="close-modal">&times;</button>
+            <h3>做功德</h3>
+            <div>
+                <img id="modal-qrcode" src="/qrcode" alt="捐款二维码">
+            </div>
+            <p>微信或支付宝扫码即可捐款</p>
+        </div>
+    </div>
+    
+    <!-- 头部区域 -->
+    <div class="header">
+        <div class="header-content">
+            <img src="" alt="logo" class="header-logo">
+            <div>
+                <h1> 功德榜</h1>
+                <div style="font-size: 16px; margin-bottom: 10px; font-weight: normal;"></div>
+                <div class="header-info"></div>
+            </div>
+        </div>
+    </div>
+
+    <div class="merit-list">
+        <div id="rankings-list" class="merit-grid">
+            <!-- 功德记录将通过JavaScript动态加载 -->
+        </div>
+    </div>
+
+    <script src="/static/index-script.js"></script>
+</body>
+</html>
