@@ -1112,8 +1112,8 @@ func (ar *APIRoutes) GetRankings(ctx *fasthttp.RequestCtx) {
 			},
 		}
 
-		// 缓存响应数据，有效期5分钟
-		utils.Cache.Set(cacheKey, responseData, 5*time.Minute)
+		// 缓存响应数据，有效期10秒
+		utils.Cache.Set(cacheKey, responseData, 10*time.Second)
 
 		ctx.SetStatusCode(fasthttp.StatusOK)
 		ctx.Response.Header.Set("Content-Type", "application/json; charset=utf-8")
