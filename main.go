@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net"
@@ -42,7 +43,7 @@ func main() {
 	// 初始化缓存
 	utils.InitCache()
 	log.Println("Cache manager initialized successfully")
-	
+
 	// 初始化数据库
 	dbConnected := utils.InitDatabase(
 		viper.GetString("mysql.host"),
@@ -192,9 +193,9 @@ func main() {
 		DisableKeepalive:   false,             // 启用长连接
 		ReduceMemoryUsage:  true,              // 启用内存使用优化
 		// 启用HTTP/2支持
-		NoDefaultServerHeader: true,           // 禁用默认服务器头部，提高安全性
-		NoDefaultDate:         true,           // 禁用默认日期头部，减少响应大小
-		NoDefaultContentType:  false,          // 保持默认内容类型
+		NoDefaultServerHeader: true,  // 禁用默认服务器头部，提高安全性
+		NoDefaultDate:         true,  // 禁用默认日期头部，减少响应大小
+		NoDefaultContentType:  false, // 保持默认内容类型
 	}
 
 	// 检查并清理端口占用
@@ -205,8 +206,10 @@ func main() {
 	// 短暂延迟确保端口释放
 	time.Sleep(1 * time.Second)
 
-	// 创建TCP监听器
-	listener, err := net.Listen("tcp", addr)
+	// 创建TCP监听器，设置大的backlog值以匹配Linux内核的net.core.somaxconn=65535
+	listenConfig := &net.ListenConfig{}
+	// 在Go 1.21+中，ListenConfig支持Backlog字段
+	listener, err := listenConfig.Listen(context.Background(), "tcp", addr)
 	if err != nil {
 		log.Fatalf("Failed to create listener: %v", err)
 	}
