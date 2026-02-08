@@ -305,9 +305,16 @@ function connectWebSocket() {
                         if (data.type === 'pay_success') {
                             showPaymentSuccessNotification(data);
                             
-                            // 直接调用轮询函数，使用相同的数据处理逻辑
-                            console.log('Broadcast received, using pollForNewDonations for consistent processing');
-                            pollForNewDonations();
+                            // 检查消息是否包含完整数据
+                            if (data.id && data.amount && data.created_at && data.user_name) {
+                                // 消息包含完整数据，直接使用
+                                console.log('Using broadcast data directly, skipping network request');
+                                insertNewPaymentRecord(data);
+                            } else {
+                                // 消息数据不完整，调用轮询函数获取完整数据
+                                console.log('Broadcast data incomplete, using pollForNewDonations for consistent processing');
+                                pollForNewDonations();
+                            }
                         } else {
                             console.log('Unknown WebSocket message type:', data.type);
                         }
@@ -558,10 +565,60 @@ function showPaymentSuccessNotification(data) {
 const dataCache = {
     paymentConfig: null,
     categories: null,
-    rankings: []
+    rankings: [],
+    lastUpdated: 0
 };
 
 // 用于去重的捐款记录ID集合 - 已在文件顶部初始化
+
+// 本地存储缓存键
+const STORAGE_KEYS = {
+    PAYMENT_CONFIG: 'payment_config',
+    CATEGORIES: 'categories',
+    RANKINGS: 'rankings'
+};
+
+// 本地存储缓存过期时间（毫秒）
+const CACHE_EXPIRY = {
+    PAYMENT_CONFIG: 3600000, // 1小时
+    CATEGORIES: 3600000, // 1小时
+    RANKINGS: 600000 // 10分钟
+};
+
+// 本地存储操作封装
+const storage = {
+    get: (key) => {
+        try {
+            const item = localStorage.getItem(key);
+            if (item) {
+                const parsed = JSON.parse(item);
+                if (parsed.expiry && Date.now() < parsed.expiry) {
+                    return parsed.data;
+                }
+            }
+            return null;
+        } catch (e) {
+            return null;
+        }
+    },
+    set: (key, data, expiry) => {
+        try {
+            localStorage.setItem(key, JSON.stringify({
+                data,
+                expiry: Date.now() + expiry
+            }));
+        } catch (e) {
+            // 忽略存储错误
+        }
+    },
+    remove: (key) => {
+        try {
+            localStorage.removeItem(key);
+        } catch (e) {
+            // 忽略存储错误
+        }
+    }
+};
 
 // 获取支付配置信息
 async function getPaymentConfig(paymentConfigId) {
@@ -569,13 +626,27 @@ async function getPaymentConfig(paymentConfigId) {
         return null;
     }
     
+    // 尝试从本地存储获取缓存
+    const cacheKey = `${STORAGE_KEYS.PAYMENT_CONFIG}_${paymentConfigId}`;
+    const cachedConfig = storage.get(cacheKey);
+    if (cachedConfig) {
+        return cachedConfig;
+    }
+    
     try {
         const url = `/api/payment-config/${paymentConfigId}`;
-        const response = await fetch(url);
+        const response = await fetch(url, {
+            headers: {
+                'Cache-Control': 'max-age=3600'
+            }
+        });
         if (!response.ok) {
             throw new Error(`网络请求失败: ${response.status}`);
         }
-        return await response.json();
+        const config = await response.json();
+        // 缓存到本地存储
+        storage.set(cacheKey, config, CACHE_EXPIRY.PAYMENT_CONFIG);
+        return config;
     } catch (error) {
         return null;
     }
@@ -597,63 +668,36 @@ async function fetchConfigData() {
     
     if (!dataCache.categories) {
         const payment = params.payment_config_id || '6';
-        promises.push(fetch(`/api/categories?p=${payment}`)
-            .then(response => {
-                if (!response.ok) {
-                    throw new Error(`网络请求失败: ${response.status}`);
+        // 尝试从本地存储获取缓存
+        const cacheKey = `${STORAGE_KEYS.CATEGORIES}_${payment}`;
+        const cachedCategories = storage.get(cacheKey);
+        
+        if (cachedCategories) {
+            dataCache.categories = cachedCategories;
+            buildDropdownMenu(cachedCategories, params);
+        } else {
+            promises.push(fetch(`/api/categories?p=${payment}`, {
+                headers: {
+                    'Cache-Control': 'max-age=3600'
                 }
-                return response.json();
             })
-            .then(categories => {
-                dataCache.categories = categories;
-                
-                // 构建下拉菜单
-                const currentCategory = params.category_id || '';
-                const dropdownContent = document.querySelector('.dropdown-content');
-                const dropdownBtn = document.querySelector('.dropdown-btn');
-                
-                if (dropdownContent) {
-                    dropdownContent.innerHTML = '';
-                    
-                    if (Array.isArray(categories) && categories.length > 0) {
-                        categories.forEach(category => {
-                            const categoryItem = document.createElement('a');
-                            categoryItem.href = `/?p=${payment}&c=${category.id}`;
-                            categoryItem.className = `dropdown-item ${currentCategory === category.id.toString() ? 'active' : ''}`;
-                            categoryItem.textContent = category.name;
-                            dropdownContent.appendChild(categoryItem);
-                        });
-                    } else {
-                        const homeItem = document.createElement('a');
-                        homeItem.href = `/?p=${payment}`;
-                        homeItem.className = `dropdown-item ${!currentCategory ? 'active' : ''}`;
-                        homeItem.textContent = '首页';
-                        dropdownContent.appendChild(homeItem);
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error(`网络请求失败: ${response.status}`);
                     }
-                }
-                
-                if (dropdownBtn) {
-                    if (Array.isArray(categories) && categories.length > 0) {
-                        if (currentCategory) {
-                            const currentCat = categories.find(cat => cat.id.toString() === currentCategory);
-                            if (currentCat) {
-                                dropdownBtn.textContent = currentCat.name;
-                            } else {
-                                dropdownBtn.textContent = '栏目列表';
-                            }
-                        } else {
-                            dropdownBtn.textContent = categories[0].name;
-                        }
-                    } else {
-                        dropdownBtn.textContent = '栏目列表';
-                    }
-                }
-                
-                return categories;
-            })
-            .catch(error => {
-                return null;
-            }));
+                    return response.json();
+                })
+                .then(categories => {
+                    dataCache.categories = categories;
+                    // 缓存到本地存储
+                    storage.set(cacheKey, categories, CACHE_EXPIRY.CATEGORIES);
+                    buildDropdownMenu(categories, params);
+                    return categories;
+                })
+                .catch(error => {
+                    return null;
+                }));
+        }
     }
     
     if (promises.length > 0) {
@@ -664,6 +708,55 @@ async function fetchConfigData() {
             updateTitles();
         } catch (error) {
             // 即使失败也继续执行，不阻塞页面加载
+        }
+    } else {
+        // 没有异步操作，直接更新logo和标题
+        updateLogo();
+        updateTitles();
+    }
+}
+
+// 构建下拉菜单
+function buildDropdownMenu(categories, params) {
+    const payment = params.payment_config_id || '6';
+    const currentCategory = params.category_id || '';
+    const dropdownContent = document.querySelector('.dropdown-content');
+    const dropdownBtn = document.querySelector('.dropdown-btn');
+    
+    if (dropdownContent) {
+        dropdownContent.innerHTML = '';
+        
+        if (Array.isArray(categories) && categories.length > 0) {
+            categories.forEach(category => {
+                const categoryItem = document.createElement('a');
+                categoryItem.href = `/?p=${payment}&c=${category.id}`;
+                categoryItem.className = `dropdown-item ${currentCategory === category.id.toString() ? 'active' : ''}`;
+                categoryItem.textContent = category.name;
+                dropdownContent.appendChild(categoryItem);
+            });
+        } else {
+            const homeItem = document.createElement('a');
+            homeItem.href = `/?p=${payment}`;
+            homeItem.className = `dropdown-item ${!currentCategory ? 'active' : ''}`;
+            homeItem.textContent = '首页';
+            dropdownContent.appendChild(homeItem);
+        }
+    }
+    
+    if (dropdownBtn) {
+        if (Array.isArray(categories) && categories.length > 0) {
+            if (currentCategory) {
+                const currentCat = categories.find(cat => cat.id.toString() === currentCategory);
+                if (currentCat) {
+                    dropdownBtn.textContent = currentCat.name;
+                } else {
+                    dropdownBtn.textContent = '栏目列表';
+                }
+            } else {
+                dropdownBtn.textContent = categories[0].name;
+            }
+        } else {
+            dropdownBtn.textContent = '栏目列表';
         }
     }
 }
@@ -851,7 +944,13 @@ async function loadRankings(append = false) {
             url += `&categories=${params.category_id}`;
         }
         
-        const response = await fetch(url);
+        // 发起请求，添加缓存控制头
+        const response = await fetch(url, {
+            headers: {
+                'Cache-Control': append ? 'no-cache' : 'max-age=60'
+            }
+        });
+        
         if (!response.ok) {
             throw new Error(`网络请求失败: ${response.status}`);
         }
@@ -875,6 +974,7 @@ async function loadRankings(append = false) {
             }
         });
         dataCache.rankings = [...dataCache.rankings, ...data.rankings];
+        dataCache.lastUpdated = Date.now();
         
         if (data.rankings.length === 0) {
             if (!append) {
@@ -913,7 +1013,7 @@ async function loadRankings(append = false) {
                     ${item.blessing ? `<div style="font-size: 14px; color: #666; margin: 8px 0;">${item.blessing}</div>` : ''}
                     <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; margin-top: 8px;">
                         <div style="display: flex; align-items: center; gap: 10px;">
-                            <img src="${item.avatar_url}" alt="头像" style="width: 32px; height: 32px; border-radius: 8px;">
+                            <img src="${item.avatar_url}" alt="头像" style="width: 32px; height: 32px; border-radius: 8px;" loading="lazy">
                             <span style="font-size: 14px; font-weight: bold;">${item.user_name || '匿名施主'}</span>
                         </div>
                         <div class="merit-time">${formattedDate} ${formattedTime}</div>
@@ -1081,8 +1181,12 @@ function adjustPollingInterval(success) {
         console.log(`Polling interval adjusted (failure): ${currentPollingInterval} ms`);
     }
     
-    // 重启轮询以应用新的间隔
-    startPolling();
+    // 直接更新定时器，避免立即执行轮询
+    if (pollingInterval) {
+        clearInterval(pollingInterval);
+        pollingInterval = setInterval(pollForNewDonations, currentPollingInterval);
+        console.log(`Polling interval updated: ${currentPollingInterval} ms`);
+    }
 }
 
 // 轮询获取新的捐款记录

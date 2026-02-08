@@ -21,7 +21,7 @@ type PaymentConfig struct {
 	StoreName    string    `gorm:"size:255" json:"store_name"`
 	
 	// 设备配置
-	DeviceID     string    `gorm:"size:50" json:"device_id"`
+	DeviceID     string    `gorm:"size:50;index" json:"device_id"`
 	
 	// API配置
 	APIURL       string    `gorm:"size:255" json:"api_url"`
@@ -47,7 +47,7 @@ type PaymentConfig struct {
 	AlipayPrivateKey  string    `gorm:"size:500" json:"alipay_private_key"`  // 应用私钥
 	
 	// 管理字段
-	IsActive     bool      `gorm:"default:true" json:"is_active"`
+	IsActive     bool      `gorm:"default:true;index" json:"is_active"`
 	LastSignInAt time.Time `json:"last_sign_in_at"`
 	Description  string    `gorm:"size:255" json:"description"`
 	CreatedAt    time.Time `json:"created_at"`

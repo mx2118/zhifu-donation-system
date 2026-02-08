@@ -39,6 +39,10 @@ func main() {
 		}
 	}
 
+	// 初始化缓存
+	utils.InitCache()
+	log.Println("Cache manager initialized successfully")
+	
 	// 初始化数据库
 	dbConnected := utils.InitDatabase(
 		viper.GetString("mysql.host"),
@@ -171,9 +175,12 @@ func main() {
 	port := viper.GetInt("server.port")
 	addr := fmt.Sprintf(":%d", port)
 
+	// 创建压缩处理器，启用GZIP压缩
+	compressedHandler := fasthttp.CompressHandler(handler)
+
 	// 创建fasthttp服务器
 	server := &fasthttp.Server{
-		Handler:            handler, // 不使用压缩处理器
+		Handler:            compressedHandler, // 使用压缩处理器
 		Name:               "zhifu-server",
 		ReadTimeout:        10 * time.Second,  // 减少读取超时，更快释放资源
 		WriteTimeout:       10 * time.Second,  // 减少写入超时，更快释放资源
@@ -184,6 +191,10 @@ func main() {
 		Concurrency:        20000,             // 增加最大并发连接数
 		DisableKeepalive:   false,             // 启用长连接
 		ReduceMemoryUsage:  true,              // 启用内存使用优化
+		// 启用HTTP/2支持
+		NoDefaultServerHeader: true,           // 禁用默认服务器头部，提高安全性
+		NoDefaultDate:         true,           // 禁用默认日期头部，减少响应大小
+		NoDefaultContentType:  false,          // 保持默认内容类型
 	}
 
 	// 检查并清理端口占用
