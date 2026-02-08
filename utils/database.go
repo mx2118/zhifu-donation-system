@@ -2,6 +2,7 @@ package utils
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"time"
 
@@ -44,10 +45,14 @@ func InitDatabase(host, user, password, dbname string, port int) error {
 	}
 
 	// 设置连接池参数
-	sqlDB.SetMaxIdleConns(20)           // 增加最大空闲连接数，提高并发处理能力
-	sqlDB.SetMaxOpenConns(200)          // 增加最大打开连接数，适应高并发场景
-	sqlDB.SetConnMaxLifetime(5 * time.Minute) // 减少连接最大生命周期，避免使用过期连接
-	sqlDB.SetConnMaxIdleTime(2 * time.Minute) // 减少连接最大空闲时间，释放不必要的连接
+	sqlDB.SetMaxIdleConns(30)           // 增加最大空闲连接数，提高并发处理能力
+	sqlDB.SetMaxOpenConns(300)          // 增加最大打开连接数，适应高并发场景
+	sqlDB.SetConnMaxLifetime(5 * time.Minute) // 连接最大生命周期，避免使用过期连接
+	sqlDB.SetConnMaxIdleTime(1 * time.Minute) // 连接最大空闲时间，释放不必要的连接
+	
+	// 验证连接池配置
+	log.Printf("Database connection pool configured: MaxIdle=%d, MaxOpen=%d, MaxLifetime=%s, MaxIdleTime=%s",
+		30, 300, 5*time.Minute, 1*time.Minute)
 
 	return nil
 }

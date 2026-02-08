@@ -70,9 +70,15 @@ var Upgrader = websocket.FastHTTPUpgrader{
 
 // HandleWebSocket 处理WebSocket连接
 func (m *WebSocketManager) HandleWebSocket(ctx *fasthttp.RequestCtx) {
-	// 获取请求参数
+	// 获取请求参数（支持别名）
 	payment := string(ctx.QueryArgs().Peek("payment"))
+	if payment == "" {
+		payment = string(ctx.QueryArgs().Peek("p"))
+	}
 	categories := string(ctx.QueryArgs().Peek("categories"))
+	if categories == "" {
+		categories = string(ctx.QueryArgs().Peek("c"))
+	}
 
 	fmt.Printf("[DEBUG] WebSocket upgrade attempt: payment='%s', categories='%s', IP=%s\n", payment, categories, string(ctx.RemoteIP().String()))
 
@@ -223,6 +229,7 @@ func (m *WebSocketManager) BroadcastToSpecific(notification *PayNotification, pa
 
 	// 统计发送数量
 	sentCount := 0
+	failedCount := 0
 
 	// 每个连接独立goroutine推送
 	m.Clients.Range(func(key, value interface{}) bool {
@@ -233,21 +240,34 @@ func (m *WebSocketManager) BroadcastToSpecific(notification *PayNotification, pa
 		categoriesMatch := (categories == "" || clientConn.Categories == categories)
 
 		if paymentMatch && categoriesMatch {
+			// 捕获key变量，避免并发问题
+			connKey := key
 			go func() {
-				if err := clientConn.Conn.WriteMessage(websocket.TextMessage, data); err != nil {
-					log.Printf("Broadcast write error: %v, connID=%s, IP=%s", err, clientConn.ConnID, clientConn.IP)
-					// 关闭连接并清理
-					clientConn.Conn.Close()
-					m.Clients.Delete(key)
-				} else {
-					sentCount++
+				// 尝试发送消息，最多重试2次
+				retryCount := 0
+				maxRetries := 2
+				
+				for retryCount < maxRetries {
+					if err := clientConn.Conn.WriteMessage(websocket.TextMessage, data); err != nil {
+						retryCount++
+						if retryCount >= maxRetries {
+							log.Printf("Broadcast write error: %v, connID=%s, IP=%s", err, clientConn.ConnID, clientConn.IP)
+							// 关闭连接并清理
+							clientConn.Conn.Close()
+							m.Clients.Delete(connKey)
+							failedCount++
+						}
+					} else {
+						sentCount++
+						break
+					}
 				}
 			}()
 		}
 		return true
 	})
 
-	log.Printf("Broadcast pay notification to specific clients: orderNo=%s, amount=%s, payment='%s', categories='%s', sentCount=%d", notification.OrderNo, notification.Amount, payment, categories, sentCount)
+	log.Printf("Broadcast pay notification to specific clients: orderNo=%s, amount=%s, payment='%s', categories='%s', sentCount=%d, failedCount=%d", notification.OrderNo, notification.Amount, payment, categories, sentCount, failedCount)
 }
 
 // GetConnectionCount 获取连接数

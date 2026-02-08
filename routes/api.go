@@ -52,9 +52,15 @@ func (ar *APIRoutes) HandleRequest(ctx *fasthttp.RequestCtx, baseDir string) {
 
 	// 处理WebSocket路径
 	if path == "/ws/pay-notify" {
-		// 获取WebSocket参数
+		// 获取WebSocket参数（支持别名）
 		payment := string(ctx.QueryArgs().Peek("payment"))
+		if payment == "" {
+			payment = string(ctx.QueryArgs().Peek("p"))
+		}
 		categories := string(ctx.QueryArgs().Peek("categories"))
+		if categories == "" {
+			categories = string(ctx.QueryArgs().Peek("c"))
+		}
 		fmt.Printf("[DEBUG] WebSocket connection attempt: path='%s', method='%s', IP='%s', payment='%s', categories='%s'\n", path, method, string(ctx.RemoteIP().String()), payment, categories)
 		ar.wsManager.HandleWebSocket(ctx)
 		return
@@ -108,9 +114,15 @@ func (ar *APIRoutes) HandleRequest(ctx *fasthttp.RequestCtx, baseDir string) {
 
 	// 首页，支持带参数访问
 	case path == "/" && method == "GET":
-		// 获取参数
+		// 获取参数（支持别名）
 		payment := string(ctx.QueryArgs().Peek("payment"))
+		if payment == "" {
+			payment = string(ctx.QueryArgs().Peek("p"))
+		}
 		categories := string(ctx.QueryArgs().Peek("categories"))
+		if categories == "" {
+			categories = string(ctx.QueryArgs().Peek("c"))
+		}
 		log.Printf("Home page accessed with payment=%s, categories=%s", payment, categories)
 		// 提供正式的业务逻辑页面
 		ar.serveTemplate(ctx, "templates/index.html")
@@ -290,10 +302,13 @@ func (ar *APIRoutes) CreateDonationForm(ctx *fasthttp.RequestCtx) {
 	if openid == "" {
 		openid = "anonymous"
 	}
-	// 获取payment_configs的ID（从表单或URL参数中获取）
+	// 获取payment_configs的ID（从表单或URL参数中获取，支持别名）
 	paymentConfigID := string(ctx.FormValue("payment_config_id"))
 	if paymentConfigID == "" {
 		paymentConfigID = string(ctx.QueryArgs().Peek("payment"))
+		if paymentConfigID == "" {
+			paymentConfigID = string(ctx.QueryArgs().Peek("p"))
+		}
 	}
 
 	// 使用goroutine和channel处理超时
@@ -331,7 +346,11 @@ func (ar *APIRoutes) CreateDonationForm(ctx *fasthttp.RequestCtx) {
 // CheckUserExists 检查用户是否存在
 func (ar *APIRoutes) CheckUserExists(ctx *fasthttp.RequestCtx) {
 	openid := string(ctx.QueryArgs().Peek("openid"))
+	// 获取payment参数（支持别名）
 	payment := string(ctx.QueryArgs().Peek("payment"))
+	if payment == "" {
+		payment = string(ctx.QueryArgs().Peek("p"))
+	}
 
 	if openid == "" || payment == "" {
 		ctx.SetStatusCode(fasthttp.StatusBadRequest)
@@ -369,9 +388,15 @@ func (ar *APIRoutes) WechatAuth(ctx *fasthttp.RequestCtx) {
 	// 获取重定向URL参数
 	redirectURL := string(ctx.QueryArgs().Peek("redirect_url"))
 
-	// 获取payment和categories参数
+	// 获取payment和categories参数（支持别名）
 	payment := string(ctx.QueryArgs().Peek("payment"))
+	if payment == "" {
+		payment = string(ctx.QueryArgs().Peek("p"))
+	}
 	categories := string(ctx.QueryArgs().Peek("categories"))
+	if categories == "" {
+		categories = string(ctx.QueryArgs().Peek("c"))
+	}
 
 	if redirectURL == "" {
 		// 默认重定向到支付页面
@@ -444,9 +469,15 @@ func (ar *APIRoutes) WechatAuthCallback(ctx *fasthttp.RequestCtx) {
 	// 获取重定向URL参数
 	redirectURL := string(ctx.QueryArgs().Peek("redirect_url"))
 
-	// 获取payment和categories参数
+	// 获取payment和categories参数（支持别名）
 	payment := string(ctx.QueryArgs().Peek("payment"))
+	if payment == "" {
+		payment = string(ctx.QueryArgs().Peek("p"))
+	}
 	categories := string(ctx.QueryArgs().Peek("categories"))
+	if categories == "" {
+		categories = string(ctx.QueryArgs().Peek("c"))
+	}
 
 	// 构建重定向URL
 	redirectURL = ar.buildRedirectURL(redirectURL, payment, categories)
@@ -512,9 +543,15 @@ func (ar *APIRoutes) AlipayAuth(ctx *fasthttp.RequestCtx) {
 	// 获取重定向URL参数
 	redirectURL := string(ctx.QueryArgs().Peek("redirect_url"))
 
-	// 获取payment和categories参数
+	// 获取payment和categories参数（支持别名）
 	payment := string(ctx.QueryArgs().Peek("payment"))
+	if payment == "" {
+		payment = string(ctx.QueryArgs().Peek("p"))
+	}
 	categories := string(ctx.QueryArgs().Peek("categories"))
+	if categories == "" {
+		categories = string(ctx.QueryArgs().Peek("c"))
+	}
 
 	if redirectURL == "" {
 		// 默认重定向到支付页面
@@ -595,11 +632,17 @@ func (ar *APIRoutes) AlipayAuthCallback(ctx *fasthttp.RequestCtx) {
 		}
 	}
 
-	// 获取payment和categories参数
+	// 获取payment和categories参数（支持别名）
 	payment := string(ctx.QueryArgs().Peek("payment"))
+	if payment == "" {
+		payment = string(ctx.QueryArgs().Peek("p"))
+	}
 	categories := string(ctx.QueryArgs().Peek("categories"))
+	if categories == "" {
+		categories = string(ctx.QueryArgs().Peek("c"))
+	}
 
-	// 尝试从redirect_url中解析payment和categories参数
+	// 尝试从redirect_url中解析payment和categories参数（支持别名）
 	if payment == "" || categories == "" {
 		if redirectURL != "" {
 			parsedURL, err := url.Parse(redirectURL)
@@ -607,9 +650,15 @@ func (ar *APIRoutes) AlipayAuthCallback(ctx *fasthttp.RequestCtx) {
 				params := parsedURL.Query()
 				if payment == "" {
 					payment = params.Get("payment")
+					if payment == "" {
+						payment = params.Get("p")
+					}
 				}
 				if categories == "" {
 					categories = params.Get("categories")
+					if categories == "" {
+						categories = params.Get("c")
+					}
 				}
 			}
 		}
@@ -1006,12 +1055,29 @@ func (ar *APIRoutes) GetRankings(ctx *fasthttp.RequestCtx) {
 		page = 1
 	}
 
-	// 获取payment和categories参数
+	// 获取payment和categories参数（支持别名）
 	paymentConfigID := string(ctx.QueryArgs().Peek("payment"))
+	if paymentConfigID == "" {
+		paymentConfigID = string(ctx.QueryArgs().Peek("p"))
+	}
 	categoryID := string(ctx.QueryArgs().Peek("categories"))
+	if categoryID == "" {
+		categoryID = string(ctx.QueryArgs().Peek("c"))
+	}
 
 	// 计算偏移量
 	offset := (page - 1) * limit
+
+	// 构建缓存键
+	cacheKey := fmt.Sprintf("rankings:%d:%d:%s:%s", limit, offset, paymentConfigID, categoryID)
+
+	// 尝试从缓存获取
+	if cachedData, found := utils.Cache.Get(cacheKey); found {
+		ctx.SetStatusCode(fasthttp.StatusOK)
+		ctx.Response.Header.Set("Content-Type", "application/json; charset=utf-8")
+		json.NewEncoder(ctx).Encode(cachedData)
+		return
+	}
 
 	// 使用goroutine和channel处理超时
 	type result struct {
@@ -1035,9 +1101,8 @@ func (ar *APIRoutes) GetRankings(ctx *fasthttp.RequestCtx) {
 			return
 		}
 
-		ctx.SetStatusCode(fasthttp.StatusOK)
-		ctx.Response.Header.Set("Content-Type", "application/json; charset=utf-8")
-		json.NewEncoder(ctx).Encode(map[string]interface{}{
+		// 构建响应数据
+		responseData := map[string]interface{}{
 			"rankings": res.rankings,
 			"pagination": map[string]interface{}{
 				"limit":  limit,
@@ -1045,7 +1110,14 @@ func (ar *APIRoutes) GetRankings(ctx *fasthttp.RequestCtx) {
 				"offset": offset,
 				"total":  len(res.rankings),
 			},
-		})
+		}
+
+		// 缓存响应数据，有效期5分钟
+		utils.Cache.Set(cacheKey, responseData, 5*time.Minute)
+
+		ctx.SetStatusCode(fasthttp.StatusOK)
+		ctx.Response.Header.Set("Content-Type", "application/json; charset=utf-8")
+		json.NewEncoder(ctx).Encode(responseData)
 	case <-ctxTimeout.Done():
 		ctx.SetStatusCode(fasthttp.StatusRequestTimeout)
 		ctx.Response.Header.Set("Content-Type", "application/json")
@@ -1093,8 +1165,11 @@ func (ar *APIRoutes) ActivateTerminal(ctx *fasthttp.RequestCtx) {
 
 // GenerateQRCode 生成统一支付二维码
 func (ar *APIRoutes) GenerateQRCode(ctx *fasthttp.RequestCtx) {
-	// 获取payment参数
+	// 获取payment参数（支持别名）
 	payment := string(ctx.QueryArgs().Peek("payment"))
+	if payment == "" {
+		payment = string(ctx.QueryArgs().Peek("p"))
+	}
 
 	// 如果payment参数不存在，返回首页
 	if payment == "" {
@@ -1102,8 +1177,11 @@ func (ar *APIRoutes) GenerateQRCode(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	// 获取categories参数
+	// 获取categories参数（支持别名）
 	categories := string(ctx.QueryArgs().Peek("categories"))
+	if categories == "" {
+		categories = string(ctx.QueryArgs().Peek("c"))
+	}
 
 	// 当payment有参数时，如果没有categories参数，自动设置默认的categories参数
 	if categories == "" {
@@ -1202,8 +1280,11 @@ func (ar *APIRoutes) GetCategories(ctx *fasthttp.RequestCtx) {
 	var categories []models.Category
 	query := utils.DB
 
-	// 根据payment参数过滤
+	// 根据payment参数过滤（支持别名）
 	payment := string(ctx.QueryArgs().Peek("payment"))
+	if payment == "" {
+		payment = string(ctx.QueryArgs().Peek("p"))
+	}
 	if payment != "" {
 		query = query.Where("payment = ?", payment)
 	}
