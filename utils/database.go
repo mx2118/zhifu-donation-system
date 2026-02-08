@@ -2,11 +2,9 @@ package utils
 
 import (
 	"fmt"
-	"log"
 	"os"
 	"time"
 
-	"github.com/zhifu/donation-rank/models"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -26,62 +24,30 @@ func InitDatabase(host, user, password, dbname string, port int) error {
 		logLevel = logger.Error // 生产环境只记录错误
 	}
 
-	newLogger := logger.New(
-		log.New(os.Stdout, "\r\n", log.LstdFlags),
-		logger.Config{
-			LogLevel: logLevel,
-		},
-	)
+	// 使用默认日志配置
+	newLogger := logger.Default.LogMode(logLevel)
 
 	// 连接数据库
 	var err error
-	log.Printf("Attempting to connect to database: %s:%d/%s", host, port, dbname)
-	log.Printf("DSN: %s", dsn)
-	
 	DB, err = gorm.Open(mysql.Open(dsn), &gorm.Config{
 		Logger: newLogger,
 	})
 
 	if err != nil {
-		log.Printf("Failed to connect to database: %v", err)
-		log.Printf("Connection details: host=%s, port=%d, user=%s, dbname=%s", host, port, user, dbname)
 		return err
 	}
-	
-	log.Printf("Database connection successful!")
 
 	// 配置数据库连接池
 	sqlDB, err := DB.DB()
 	if err != nil {
-		log.Printf("Failed to get database: %v", err)
 		return err
 	}
 
 	// 设置连接池参数
-	sqlDB.SetMaxIdleConns(15)           // 最大空闲连接数
-	sqlDB.SetMaxOpenConns(120)          // 最大打开连接数
-	sqlDB.SetConnMaxLifetime(time.Hour) // 连接最大生命周期
-	sqlDB.SetConnMaxIdleTime(30 * time.Minute) // 连接最大空闲时间
+	sqlDB.SetMaxIdleConns(20)           // 增加最大空闲连接数，提高并发处理能力
+	sqlDB.SetMaxOpenConns(200)          // 增加最大打开连接数，适应高并发场景
+	sqlDB.SetConnMaxLifetime(5 * time.Minute) // 减少连接最大生命周期，避免使用过期连接
+	sqlDB.SetConnMaxIdleTime(2 * time.Minute) // 减少连接最大空闲时间，释放不必要的连接
 
-	// 跳过数据库迁移，根据用户要求
 	return nil
-}
-
-// MigrateDatabase 手动执行数据库迁移
-func MigrateDatabase() {
-	migrateDatabase()
-}
-
-// migrateDatabase 执行数据库迁移
-func migrateDatabase() {
-	// 创建必要的表
-	log.Println("Starting database migration...")
-	DB.AutoMigrate(
-		&models.Donation{},
-		&models.PaymentConfig{},
-		&models.WechatUser{},
-		&models.AlipayUser{},
-		&models.Category{},
-	)
-	log.Println("Database migration completed successfully!")
 }

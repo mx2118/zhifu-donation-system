@@ -89,11 +89,24 @@ type PaymentService struct {
 	cacheExpiration     time.Duration            // 缓存过期时间
 	// HTTP客户端连接池
 	httpClient *http.Client
+	// 广播状态管理
+	BroadcastedOrders sync.Map // 已广播的订单，key为orderID，value为true
 }
 
 // Config 获取当前支付服务配置
 func (ps *PaymentService) Config() ShouqianbaConfig {
 	return ps.config
+}
+
+// isBroadcasted 检查订单是否已经广播过
+func (ps *PaymentService) isBroadcasted(orderID string) bool {
+	_, ok := ps.BroadcastedOrders.Load(orderID)
+	return ok
+}
+
+// markAsBroadcasted 标记订单为已广播
+func (ps *PaymentService) markAsBroadcasted(orderID string) {
+	ps.BroadcastedOrders.Store(orderID, true)
 }
 
 // 注意：已删除LoadTerminalFromDB方法，现在配置从PaymentConfig表统一加载
@@ -135,15 +148,11 @@ func NewPaymentService(config ShouqianbaConfig) *PaymentService {
 // 6. 转大写
 func (ps *PaymentService) GenerateSign(params map[string]string, signType string) string {
 	// 1. 筛选参数：过滤空值，排除sign和sign_type参数
-	log.Printf("DEBUG: Step 1 - Original params: %v", params)
 	filteredParams := make(map[string]string)
 	for k, v := range params {
 		// 排除空值和不需要的字段
 		if v != "" && k != "sign" && k != "sign_type" && k != "flowT" && k != "flowSign" && k != "flow" {
 			filteredParams[k] = v
-			log.Printf("DEBUG: Step 1 - Added param: %s=%s", k, v)
-		} else {
-			log.Printf("DEBUG: Step 1 - Excluded param: %s=%s (reason: empty or excluded)", k, v)
 		}
 	}
 
@@ -153,7 +162,6 @@ func (ps *PaymentService) GenerateSign(params map[string]string, signType string
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	log.Printf("DEBUG: Step 2 - Sorted keys: %v", keys)
 
 	// 3. 拼接字符串：key=value&key=value格式
 	var signStr strings.Builder
@@ -163,10 +171,7 @@ func (ps *PaymentService) GenerateSign(params map[string]string, signType string
 		if i < len(keys)-1 {
 			signStr.WriteString("&")
 		}
-		log.Printf("DEBUG: Step 3 - %d/%d: %s=%s", i+1, len(keys), k, value)
 	}
-	preSignString := signStr.String()
-	log.Printf("DEBUG: Step 3 - Pre-sign string: %s", preSignString)
 
 	// 4. 拼接密钥，按照文档要求添加"&key="前缀
 	var signKey string
@@ -174,24 +179,19 @@ func (ps *PaymentService) GenerateSign(params map[string]string, signType string
 	case "terminal":
 		// 使用终端密钥
 		signKey = ps.config.TerminalKey
-		log.Printf("DEBUG: Step 4 - Using terminal key: %s", signKey)
 	case "vendor":
 		// 使用开发者密钥
 		signKey = ps.config.VendorKey
-		log.Printf("DEBUG: Step 4 - Using vendor key: %s", signKey)
 	default:
 		// 默认使用开发者密钥
 		signKey = ps.config.VendorKey
-		log.Printf("DEBUG: Step 4 - Using default vendor key: %s", signKey)
 	}
 	signStr.WriteString(fmt.Sprintf("&key=%s", signKey))
 	signString := signStr.String()
-	log.Printf("DEBUG: Step 4 - Final sign string: %s", signString)
 
 	// 5. MD5加密，生成32位大写（按照文档要求）
 	md5Hash := md5.Sum([]byte(signString))
 	finalSign := strings.ToUpper(hex.EncodeToString(md5Hash[:]))
-	log.Printf("DEBUG: Step 5 - Generated sign: %s", finalSign)
 
 	return finalSign
 }
@@ -1218,6 +1218,28 @@ func (ps *PaymentService) updateOrderStatusFromQuery(orderID string, result map[
 	// 更新订单状态
 	if status != "pending" || orderStatus == "PAID" || orderStatus == "PAY_CANCELED" {
 		ps.updateOrderStatus(orderID, status)
+
+		// 如果支付成功，触发广播（只对微信支付）
+		if status == "completed" {
+			log.Printf("DEBUG: Payment completed for order %s", orderID)
+			// 从订单中获取项目和分类信息
+			var donation models.Donation
+			if err := utils.DB.Where("order_id = ?", orderID).First(&donation).Error; err == nil {
+				// 只对微信支付进行广播
+				if donation.Payment == "wechat" {
+					// 检查是否已经广播过
+					if ps.isBroadcasted(orderID) {
+						log.Printf("DEBUG: Order %s already broadcasted, skipping", orderID)
+						// 跳过广播逻辑，直接继续执行
+					} else {
+						// 标记为已广播
+						ps.markAsBroadcasted(orderID)
+						// 广播逻辑已移除，由 WebSocketManager 直接处理
+					}
+				}
+			}
+		}
+
 		return true, status
 	}
 
@@ -1272,10 +1294,28 @@ func (ps *PaymentService) HandleCallback(data map[string]interface{}) error {
 		return fmt.Errorf("invalid sign")
 	}
 
-	// 获取订单号（WAP支付使用client_sn作为订单号）
+	// 获取订单号（支持多种字段名）
 	orderID, _ := data["client_sn"].(string)
+	// 尝试从其他字段获取订单号（支持微信支付）
 	if orderID == "" {
-		return fmt.Errorf("missing client_sn")
+		if id, ok := data["order_id"].(string); ok {
+			orderID = id
+			log.Printf("Got order ID from order_id: %s", orderID)
+		} else if id, ok := data["out_trade_no"].(string); ok {
+			orderID = id
+			log.Printf("Got order ID from out_trade_no: %s", orderID)
+		} else if id, ok := data["transaction_id"].(string); ok {
+			orderID = id
+			log.Printf("Got order ID from transaction_id: %s", orderID)
+		} else if wechatData, ok := data["wechat"].(map[string]interface{}); ok {
+			if wxOrderID, ok := wechatData["order_id"].(string); ok {
+				orderID = wxOrderID
+				log.Printf("Got order ID from wechat.order_id: %s", orderID)
+			}
+		}
+	}
+	if orderID == "" {
+		return fmt.Errorf("missing order ID")
 	}
 
 	// 更新订单状态
@@ -1373,10 +1413,28 @@ func (ps *PaymentService) HandleCallbackWithPublicKey(data map[string]interface{
 		return fmt.Errorf("invalid sign")
 	}
 
-	// 3. 获取订单号（WAP支付使用client_sn作为订单号）
+	// 3. 获取订单号（支持多种字段名）
 	orderID, _ := data["client_sn"].(string)
+	// 尝试从其他字段获取订单号（支持微信支付）
 	if orderID == "" {
-		return fmt.Errorf("missing client_sn")
+		if id, ok := data["order_id"].(string); ok {
+			orderID = id
+			log.Printf("Got order ID from order_id: %s", orderID)
+		} else if id, ok := data["out_trade_no"].(string); ok {
+			orderID = id
+			log.Printf("Got order ID from out_trade_no: %s", orderID)
+		} else if id, ok := data["transaction_id"].(string); ok {
+			orderID = id
+			log.Printf("Got order ID from transaction_id: %s", orderID)
+		} else if wechatData, ok := data["wechat"].(map[string]interface{}); ok {
+			if wxOrderID, ok := wechatData["order_id"].(string); ok {
+				orderID = wxOrderID
+				log.Printf("Got order ID from wechat.order_id: %s", orderID)
+			}
+		}
+	}
+	if orderID == "" {
+		return fmt.Errorf("missing order ID")
 	}
 
 	// 4. 更新订单状态
@@ -2460,12 +2518,6 @@ type RankingItem struct {
 
 // GetRankings 获取捐款排行榜
 func (ps *PaymentService) GetRankings(limit int, offset int, paymentConfigID string, categoryID string) ([]RankingItem, error) {
-	// 生成缓存键
-	cacheKey := fmt.Sprintf("rankings:%s:%s:%d:%d", paymentConfigID, categoryID, limit, offset)
-
-	// 暂时屏蔽缓存功能，每次都从数据库读取
-	log.Printf("DEBUG: Bypassing memory cache, reading directly from database for key: %s", cacheKey)
-
 	var donations []models.Donation
 
 	// 构建查询
@@ -2562,21 +2614,11 @@ func (ps *PaymentService) GetRankings(limit int, offset int, paymentConfigID str
 	// 等待所有并发查询完成
 	wg.Wait()
 
-	// 将结果存入内存缓存
-	ps.cacheMutex.Lock()
-	ps.rankingsCache[cacheKey] = rankings
-	ps.cacheMutex.Unlock()
-
-	log.Printf("DEBUG: Cached rankings in memory for key: %s", cacheKey)
-
 	return rankings, nil
 }
 
 // GetLatestDonation 获取最新的捐款记录
 func (ps *PaymentService) GetLatestDonation() (*RankingItem, error) {
-	// 暂时屏蔽缓存功能，每次都从数据库读取
-	log.Printf("DEBUG: Bypassing memory cache for latest donation, reading directly from database")
-
 	var donation models.Donation
 
 	// 查询最新的已完成捐款记录
@@ -2639,21 +2681,11 @@ func (ps *PaymentService) GetLatestDonation() (*RankingItem, error) {
 		rankingItem.AvatarURL = "./static/avatar.jpeg"
 	}
 
-	// 将结果存入内存缓存
-	ps.cacheMutex.Lock()
-	ps.latestDonationCache = rankingItem
-	ps.cacheMutex.Unlock()
-
-	log.Printf("DEBUG: Cached latest donation in memory")
-
 	return rankingItem, nil
 }
 
 // GetDonationByOrderID 根据订单ID获取捐款记录
 func (ps *PaymentService) GetDonationByOrderID(orderID string) (*RankingItem, error) {
-	// 暂时屏蔽缓存功能，每次都从数据库读取
-	log.Printf("DEBUG: Bypassing memory cache for donation by order ID, reading directly from database: %s", orderID)
-
 	var donation models.Donation
 
 	// 根据订单ID查询捐款记录

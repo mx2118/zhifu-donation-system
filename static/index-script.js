@@ -7,6 +7,441 @@ function getURLParams() {
     };
 }
 
+// WebSocket连接管理
+let ws;
+let wsHeartbeatInterval;
+let wsReconnectAttempts = 0;
+const maxReconnectAttempts = 10; // 增加重连尝试次数
+const initialReconnectDelay = 2000; // 增加初始重连延迟
+let wsConnected = false;
+let wsConnecting = false;
+let lastReconnectTime = 0;
+const reconnectCooldown = 1000; // 重连冷却时间
+
+// 检测是否是微信浏览器
+function isWeChatBrowser() {
+    const ua = navigator.userAgent.toLowerCase();
+    return ua.indexOf('micromessenger') > -1;
+}
+
+// 连接WebSocket
+function connectWebSocket() {
+    // 防止重连风暴
+    const now = Date.now();
+    if (wsConnecting || (now - lastReconnectTime < reconnectCooldown)) {
+        console.log('WebSocket connection already in progress or cooldown period');
+        return;
+    }
+    
+    wsConnecting = true;
+    lastReconnectTime = now;
+    
+    const params = getURLParams();
+    console.log('WebSocket connect function called');
+    console.log('URL params:', params);
+    console.log('Is WeChat browser:', isWeChatBrowser());
+    
+    // 动态构建WebSocket地址，根据当前页面的协议和主机名
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const host = window.location.host;
+    let wsUrl = `${protocol}//${host}/ws/pay-notify`;
+    console.log('Dynamic WebSocket URL:', wsUrl);
+    
+    // 添加参数
+    const queryParams = [];
+    if (params.payment) queryParams.push(`payment=${params.payment}`);
+    if (params.categories) queryParams.push(`categories=${params.categories}`);
+    
+    if (queryParams.length > 0) {
+        wsUrl += '?' + queryParams.join('&');
+    }
+    console.log('Final WebSocket URL:', wsUrl);
+    
+    console.log('Connecting to WebSocket:', wsUrl);
+    
+    // 清除现有的心跳定时器
+    if (wsHeartbeatInterval) {
+        clearInterval(wsHeartbeatInterval);
+        wsHeartbeatInterval = null;
+    }
+    
+    try {
+        // 关闭现有的连接
+        if (ws) {
+            try {
+                ws.close(1000, 'Reconnecting');
+            } catch (e) {
+                // 忽略关闭错误
+            }
+            ws = null;
+        }
+        
+        // 微信浏览器特殊处理：使用更可靠的连接方式
+        if (isWeChatBrowser()) {
+            console.log('Using WeChat browser optimized WebSocket connection');
+            // 微信浏览器可能需要更长的超时时间
+            setTimeout(() => {
+                if (wsConnecting) {
+                    console.log('WeChat browser connection timeout, retrying...');
+                    wsConnecting = false;
+                    connectWebSocket();
+                }
+            }, 15000); // 微信浏览器使用15秒超时
+        }
+        
+        ws = new WebSocket(wsUrl);
+        
+        // 设置WebSocket二进制类型（兼容性处理）
+        if (ws.binaryType) {
+            ws.binaryType = 'arraybuffer';
+        }
+        
+        // 超时处理
+        const connectTimeout = setTimeout(() => {
+            if (ws && ws.readyState === WebSocket.CONNECTING) {
+                console.log('WebSocket connection timeout');
+                try {
+                    ws.close(1000, 'Connection timeout');
+                } catch (e) {
+                    // 忽略错误
+                }
+                handleWebSocketError(new Error('Connection timeout'));
+            }
+        }, isWeChatBrowser() ? 15000 : 10000); // 微信浏览器使用15秒超时
+        
+        ws.onopen = function() {
+            clearTimeout(connectTimeout);
+            console.log('WebSocket connected successfully');
+            wsConnected = true;
+            wsReconnectAttempts = 0; // 重置重连尝试次数
+            wsConnecting = false;
+            
+            // 启动心跳检测
+            startWebSocketHeartbeat();
+        };
+        
+        ws.onclose = function(event) {
+            clearTimeout(connectTimeout);
+            console.log('WebSocket disconnected:', event.code, event.reason);
+            wsConnected = false;
+            wsConnecting = false;
+            
+            // 清除心跳定时器
+            if (wsHeartbeatInterval) {
+                clearInterval(wsHeartbeatInterval);
+                wsHeartbeatInterval = null;
+            }
+            
+            // 尝试重连（使用指数退避策略）
+            if (wsReconnectAttempts < maxReconnectAttempts) {
+                const delay = Math.min(initialReconnectDelay * Math.pow(2, wsReconnectAttempts), 30000); // 最大延迟30秒
+                console.log(`Attempting to reconnect in ${delay}ms...`);
+                setTimeout(connectWebSocket, delay);
+                wsReconnectAttempts++;
+            } else {
+                console.warn('Max reconnection attempts reached. Will not attempt to reconnect.');
+                // 30秒后重置重连计数器，允许再次尝试
+                setTimeout(() => {
+                    wsReconnectAttempts = 0;
+                    console.log('WebSocket reconnection attempts reset');
+                }, 30000);
+            }
+        };
+        
+        ws.onerror = function(error) {
+            clearTimeout(connectTimeout);
+            console.error('WebSocket error:', error);
+            handleWebSocketError(error);
+        };
+        
+        ws.onmessage = function(event) {
+            try {
+                // 检查是否是心跳消息
+                if (event.data === 'ping') {
+                    // 回复pong
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        try {
+                            ws.send('pong');
+                        } catch (e) {
+                            console.error('Error sending pong:', e);
+                        }
+                    }
+                    return;
+                }
+                
+                // 检查是否是pong消息（服务器回复的心跳响应）
+                if (event.data === 'pong') {
+                    // 心跳响应，不需要处理
+                    return;
+                }
+                
+                // 检查是否是字符串类型的消息
+                if (typeof event.data === 'string') {
+                    const data = JSON.parse(event.data);
+                    console.log('Received broadcast:', data);
+                    
+                    // 处理支付成功消息
+                    if (data.type === 'pay_success') {
+                        showPaymentSuccessNotification(data);
+                        
+                        // 不直接使用广播数据，而是从 /api/rankings?limit=1 获取最新数据
+                        console.log('Broadcast received, fetching latest data from /api/rankings?limit=1');
+                        
+                        // 构建API请求URL
+                        const params = getURLParams();
+                        let apiUrl = '/api/rankings?limit=1';
+                        
+                        // 添加参数
+                        if (params.payment) {
+                            apiUrl += `&payment=${encodeURIComponent(params.payment)}`;
+                        }
+                        if (params.categories) {
+                            apiUrl += `&categories=${encodeURIComponent(params.categories)}`;
+                        }
+                        
+                        // 发起请求获取最新数据
+                        fetch(apiUrl)
+                            .then(response => {
+                                if (!response.ok) {
+                                    throw new Error(`HTTP error! status: ${response.status}`);
+                                }
+                                return response.json();
+                            })
+                            .then(rankingsData => {
+                                console.log('Received latest rankings data:', rankingsData);
+                                
+                                // 使用获取到的数据更新页面
+                                if (rankingsData && rankingsData.rankings && Array.isArray(rankingsData.rankings)) {
+                                    rankingsData.rankings.forEach(donation => {
+                                        // 直接使用API返回的数据，不做任何处理
+                                        console.log('Using API data for broadcast:', donation);
+                                        insertNewPaymentRecord(donation);
+                                    });
+                                }
+                            })
+                            .catch(error => {
+                                console.error('Error fetching latest rankings:', error);
+                                // 如果API请求失败，回退到使用广播数据
+                                console.log('Falling back to broadcast data:', data);
+                                insertNewPaymentRecord(data);
+                            });
+                    }
+                } else {
+                    console.log('Received non-string WebSocket message:', event.data);
+                }
+            } catch (error) {
+                console.error('Error parsing WebSocket message:', error);
+                // 忽略解析错误，继续运行
+            }
+        };
+    } catch (error) {
+        console.error('WebSocket connection error:', error);
+        handleWebSocketError(error);
+    }
+}
+
+// 处理WebSocket错误
+function handleWebSocketError(error) {
+    wsConnected = false;
+    wsConnecting = false;
+    
+    // 尝试重连（使用指数退避策略）
+    if (wsReconnectAttempts < maxReconnectAttempts) {
+        const delay = Math.min(initialReconnectDelay * Math.pow(2, wsReconnectAttempts), 30000); // 最大延迟30秒
+        console.log(`Attempting to reconnect in ${delay}ms after error...`);
+        setTimeout(connectWebSocket, delay);
+        wsReconnectAttempts++;
+    }
+}
+
+// 启动WebSocket心跳检测
+function startWebSocketHeartbeat() {
+    // 清除现有的心跳定时器
+    if (wsHeartbeatInterval) {
+        clearInterval(wsHeartbeatInterval);
+        wsHeartbeatInterval = null;
+    }
+    
+    // 微信浏览器使用更频繁的心跳检测
+    const heartbeatInterval = isWeChatBrowser() ? 15000 : 20000; // 微信浏览器15秒，其他浏览器20秒
+    console.log('Starting WebSocket heartbeat with interval:', heartbeatInterval, 'ms');
+    
+    wsHeartbeatInterval = setInterval(function() {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            try {
+                ws.send('ping');
+                console.log('WebSocket heartbeat sent');
+                
+                // 微信浏览器特殊处理：发送心跳后等待pong响应
+                if (isWeChatBrowser()) {
+                    console.log('WeChat browser heartbeat sent, waiting for response...');
+                }
+            } catch (error) {
+                console.error('Error sending heartbeat:', error);
+                // 心跳发送失败，可能连接已断开
+                if (wsHeartbeatInterval) {
+                    clearInterval(wsHeartbeatInterval);
+                    wsHeartbeatInterval = null;
+                }
+                // 触发重连
+                if (wsConnected) {
+                    wsConnected = false;
+                    connectWebSocket();
+                }
+            }
+        } else {
+            console.log('WebSocket not open, stopping heartbeat');
+            if (wsHeartbeatInterval) {
+                clearInterval(wsHeartbeatInterval);
+                wsHeartbeatInterval = null;
+            }
+        }
+    }, heartbeatInterval);
+}
+
+// 显示支付成功通知
+function showPaymentSuccessNotification(data) {
+    // 去重检查
+    if (data.orderNo) {
+        const notificationId = `notification_${data.orderNo}`;
+        if (document.getElementById(notificationId)) {
+            console.log('Notification already exists, skipping:', data.orderNo);
+            return;
+        }
+        
+        // 创建通知元素
+        const notification = document.createElement('div');
+        notification.id = notificationId;
+        notification.className = 'payment-notification';
+        notification.innerHTML = `
+            <div class="notification-content">
+                <h4>💰 福生无量</h4>
+                <p>订单号: ${data.orderNo}</p>
+                <p>金额: ${(() => {
+                    // 将分转换成元
+                    if (data.amount) {
+                        const amount = parseFloat(data.amount);
+                        if (!isNaN(amount)) {
+                            return (amount / 100).toFixed(2);
+                        }
+                    }
+                    return data.amount || '0.00';
+                })()}</p>
+                <p>时间: ${data.Time}</p>
+            </div>
+        `;
+        
+        // 添加样式
+        notification.style.cssText = `
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+            border-radius: 8px;
+            padding: 15px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            z-index: 10000;
+            animation: slideIn 0.3s ease-out;
+        `;
+        
+        // 添加动画
+        const style = document.createElement('style');
+        style.textContent = `
+            @keyframes slideIn {
+                from {
+                    transform: translateX(100%);
+                    opacity: 0;
+                }
+                to {
+                    transform: translateX(0);
+                    opacity: 1;
+                }
+            }
+        `;
+        document.head.appendChild(style);
+        
+        // 添加到页面
+        document.body.appendChild(notification);
+        
+        // 3秒后自动移除
+        setTimeout(() => {
+            notification.style.animation = 'slideIn 0.3s ease-out reverse';
+            setTimeout(() => {
+                if (notification.parentNode) {
+                    notification.parentNode.removeChild(notification);
+                }
+            }, 300);
+        }, 3000);
+    } else {
+        // 没有订单号，直接显示
+        const notification = document.createElement('div');
+        notification.className = 'payment-notification';
+        notification.innerHTML = `
+            <div class="notification-content">
+                <h4>💰 福生无量</h4>
+                <p>订单号: ${data.orderNo || '未知'}</p>
+                <p>金额: ${(() => {
+                    // 将分转换成元
+                    if (data.amount) {
+                        const amount = parseFloat(data.amount);
+                        if (!isNaN(amount)) {
+                            return (amount / 100).toFixed(2);
+                        }
+                    }
+                    return data.amount || '0.00';
+                })()}</p>
+                <p>时间: ${data.Time}</p>
+            </div>
+        `;
+        
+        // 添加样式
+        notification.style.cssText = `
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+            border-radius: 8px;
+            padding: 15px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            z-index: 10000;
+            animation: slideIn 0.3s ease-out;
+        `;
+        
+        // 添加动画
+        const style = document.createElement('style');
+        style.textContent = `
+            @keyframes slideIn {
+                from {
+                    transform: translateX(100%);
+                    opacity: 0;
+                }
+                to {
+                    transform: translateX(0);
+                    opacity: 1;
+                }
+            }
+        `;
+        document.head.appendChild(style);
+        
+        // 添加到页面
+        document.body.appendChild(notification);
+        
+        // 3秒后自动移除
+        setTimeout(() => {
+            notification.style.animation = 'slideIn 0.3s ease-out reverse';
+            setTimeout(() => {
+                if (notification.parentNode) {
+                    notification.parentNode.removeChild(notification);
+                }
+            }, 300);
+        }, 3000);
+    }
+}
+
 // 数据缓存
 const dataCache = {
     paymentConfig: null,
@@ -31,7 +466,6 @@ async function getPaymentConfig(paymentConfigId) {
         }
         return await response.json();
     } catch (error) {
-        console.error('获取支付配置失败:', error);
         return null;
     }
 }
@@ -46,9 +480,8 @@ async function fetchConfigData() {
             dataCache.paymentConfig = config;
             return config;
         }).catch(error => {
-            console.error('获取支付配置失败:', error);
-            return null;
-        }));
+                    return null;
+                }));
     }
     
     if (!dataCache.categories) {
@@ -108,7 +541,6 @@ async function fetchConfigData() {
                 return categories;
             })
             .catch(error => {
-                console.error('获取分类失败:', error);
                 return null;
             }));
     }
@@ -120,7 +552,6 @@ async function fetchConfigData() {
             updateLogo();
             updateTitles();
         } catch (error) {
-            console.error('获取配置数据失败:', error);
             // 即使失败也继续执行，不阻塞页面加载
         }
     }
@@ -154,7 +585,7 @@ function updatePageTitle() {
     } else if (categoryName) {
         newTitle = `${categoryName} 功德榜`;
     } else {
-        newTitle = '聖爱安养院 功德榜';
+        newTitle = ' 功德榜';
     }
     
     // 更新页面标题
@@ -309,15 +740,11 @@ async function loadRankings(append = false) {
             url += `&categories=${params.categories}`;
         }
         
-        console.log('加载排行榜数据，URL:', url);
-        console.log('加载排行榜数据，参数:', params);
-        
         const response = await fetch(url);
         if (!response.ok) {
             throw new Error(`网络请求失败: ${response.status}`);
         }
         const data = await response.json();
-        console.log('加载排行榜数据，返回:', data);
         
         const rankingsList = document.getElementById('rankings-list');
         
@@ -407,8 +834,6 @@ async function loadRankings(append = false) {
         
         currentPage++;
     } catch (error) {
-        console.error('Error loading rankings:', error);
-        
         if (!append) {
             showErrorState('initLoadMore()');
         }
@@ -430,9 +855,7 @@ function handleScroll() {
         const scrollHeight = document.documentElement.scrollHeight || document.body.scrollHeight;
         const clientHeight = document.documentElement.clientHeight || window.innerHeight;
         
-        console.log('滚动事件触发: scrollTop =', scrollTop, 'scrollHeight =', scrollHeight, 'clientHeight =', clientHeight);
-        console.log('滚动事件触发: isLoading =', isLoading, 'hasMoreData =', hasMoreData);
-        console.log('滚动事件触发: lastScrollHeight =', lastScrollHeight);
+
         
         // 当滚动到距离底部100px时加载更多
         // 同时确保页面高度确实增加了，避免因为加载指示器的显示/隐藏导致的无限循环
@@ -508,186 +931,118 @@ function initModal() {
     }
 }
 
-// WebSocket连接管理
-let ws;
-let reconnectAttempts = 0;
-const maxReconnectAttempts = 99999; // 无限重连
-const reconnectDelay = 2000;
-let wsConnected = false;
-let heartbeatInterval;
-const heartbeatIntervalTime = 30000; // 30秒发送一次心跳
+// HTTP轮询管理
+let pollingInterval;
+const pollingIntervalTime = 5000; // 5秒轮询一次
+let lastDonationTime = 0;
 
-// ========== 修改1：向服务端发送客户端参数 ==========
-function sendClientParamsToServer() {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-        const params = getURLParams();
-        const paramsMsg = {
-            type: 'client_params',
-            payment: params.payment,
-            categories: params.categories
-        };
-        ws.send(JSON.stringify(paramsMsg));
-        console.log('向服务端发送客户端参数:', paramsMsg);
-    }
-}
-
-// 连接WebSocket
-function connectWebSocket() {
-    try {
-        const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsURL = `${wsProtocol}//${window.location.host}/ws`;
-        
-        console.log('尝试连接WebSocket:', wsURL);
-        
-        // 清除之前的连接
-        if (ws) {
-            try {
-                ws.close();
-            } catch (e) {
-                console.warn('关闭之前的WebSocket连接失败:', e);
-            }
-        }
-        
-        // 清除之前的心跳定时器
-        if (heartbeatInterval) {
-            clearInterval(heartbeatInterval);
-        }
-        
-        ws = new WebSocket(wsURL);
-        
-        ws.onopen = function() {
-            console.log('WebSocket连接已建立');
-            reconnectAttempts = 0;
-            wsConnected = true;
-            // ========== 修改2：连接成功后立即发送客户端参数 ==========
-            sendClientParamsToServer();
-            console.log('WebSocket连接成功，等待接收实时捐款记录');
-            
-            // 启动心跳机制
-            startHeartbeat();
-        };
-        
-        ws.onmessage = function(event) {
-            console.log('收到WebSocket消息:', event.data);
-            try {
-                const data = JSON.parse(event.data);
-                console.log('解析后的消息数据:', data);
-                handleWebSocketMessage(data);
-            } catch (error) {
-                // ========== 修改3：生产环境也打印完整错误日志 ==========
-                console.error('解析WebSocket消息失败:', error);
-                console.error('原始消息:', event.data);
-            }
-        };
-        
-        ws.onclose = function(event) {
-            console.log('WebSocket连接已关闭:', event.code, event.reason);
-            wsConnected = false;
-            
-            // 清除心跳定时器
-            if (heartbeatInterval) {
-                clearInterval(heartbeatInterval);
-            }
-            
-            // 所有情况下都尝试重连，包括正常关闭
-            attemptReconnect();
-        };
-        
-        ws.onerror = function(error) {
-            // ========== 修改4：生产环境也打印完整错误日志 ==========
-            console.error('WebSocket错误:', error);
-            
-            // 清除心跳定时器
-            if (heartbeatInterval) {
-                clearInterval(heartbeatInterval);
-            }
-            
-            // 自动尝试重连
-            attemptReconnect();
-        };
-    } catch (error) {
-        // ========== 修改5：生产环境也打印完整错误日志 ==========
-        console.error('创建WebSocket连接失败:', error);
-        
-        // 清除心跳定时器
-        if (heartbeatInterval) {
-            clearInterval(heartbeatInterval);
-        }
-        
-        attemptReconnect();
-    }
-}
-
-// 启动心跳机制
-function startHeartbeat() {
+// 启动HTTP轮询
+function startPolling() {
     // 清除之前的定时器
-    if (heartbeatInterval) {
-        clearInterval(heartbeatInterval);
+    if (pollingInterval) {
+        clearInterval(pollingInterval);
     }
     
-    // 每30秒发送一次心跳
-    heartbeatInterval = setInterval(function() {
-        if (ws && ws.readyState === WebSocket.OPEN) {
-            try {
-                ws.send(JSON.stringify({ type: 'heartbeat' }));
-                console.log('发送WebSocket心跳');
-            } catch (error) {
-                console.error('发送心跳失败:', error);
-                // 发送失败，可能连接已断开，尝试重连
-                if (heartbeatInterval) {
-                    clearInterval(heartbeatInterval);
-                }
-                attemptReconnect();
+    // 立即执行一次轮询
+    pollForNewDonations();
+    
+    // 设置轮询定时器
+    pollingInterval = setInterval(pollForNewDonations, pollingIntervalTime);
+}
+
+// 轮询获取新的捐款记录
+function pollForNewDonations() {
+    const params = getURLParams();
+    
+    // 构建API请求URL
+    let apiUrl = '/api/rankings?limit=1';
+    
+    // 添加参数
+    if (params.payment) {
+        apiUrl += `&payment=${encodeURIComponent(params.payment)}`;
+    }
+    if (params.categories) {
+        apiUrl += `&categories=${encodeURIComponent(params.categories)}`;
+    }
+    
+    console.log('Polling for new donations from:', apiUrl);
+    
+    // 暂时关闭HTTP轮询获取数据的功能，避免与WebSocket广播重复
+    console.log('HTTP polling disabled to avoid duplicate data with WebSocket broadcast');
+    /*
+    // 发起HTTP请求
+    fetch(apiUrl)
+        .then(response => {
+            if (!response.ok) {
+                throw new Error(`HTTP error! status: ${response.status}`);
             }
-        }
-    }, heartbeatIntervalTime);
-}
-
-// 尝试重连
-function attemptReconnect() {
-    reconnectAttempts++;
-    console.log(`尝试重连 (${reconnectAttempts})...`);
-    // 使用指数退避策略，增加重连延迟
-    const delay = reconnectDelay * Math.min(Math.pow(1.5, reconnectAttempts - 1), 30000);
-    setTimeout(connectWebSocket, delay);
-}
-
-// 处理WebSocket消息
-function handleWebSocketMessage(data) {
-    switch (data.type) {
-        case 'initial_data':
-            // 处理初始数据（如果需要）
-            console.log('收到初始数据:', data.rankings.length, '条记录');
-            break;
+            return response.json();
+        })
+        .then(data => {
+            console.log('Received rankings data:', data);
             
-        case 'new_donation':
-            // 处理新的捐款记录
-            console.log('收到新的捐款记录:', data.donation);
-            
-            // 检查捐款记录是否与当前页面参数匹配
-            const params = getURLParams();
-            if (checkDonationMatch(data.donation, params)) {
-                console.log('捐款记录匹配当前页面参数，添加到页面');
-                addNewDonation(data.donation);
-            } else {
-                // ========== 修改6：打印详细的不匹配原因 ==========
-                console.error('捐款记录不匹配当前页面参数，跳过添加');
-                console.error('当前页面参数:', params);
-                console.error('捐款记录参数:', {
-                    payment: data.donation.payment || data.donation.Payment,
-                    payment_config_id: data.donation.payment_config_id || data.donation.PaymentConfigID,
-                    category_id: data.donation.category_id || data.donation.CategoryID,
-                    categories: data.donation.categories || data.donation.Categories
+            // 处理响应数据
+            if (data && data.rankings && Array.isArray(data.rankings)) {
+                console.log('Processing', data.rankings.length, 'rankings');
+                data.rankings.forEach(donation => {
+                    console.log('Processing donation:', donation);
+                    
+                    // 检查捐款记录是否与当前页面参数匹配
+                    if (checkDonationMatch(donation, params)) {
+                        console.log('Donation matches current page parameters');
+                        
+                        // 检查是否是新的捐款记录（通过ID判断）
+                        const donationId = (donation.id || donation.ID || '').toString().trim();
+                        console.log('Donation ID:', donationId);
+                        
+                        if (donationId && !donationIds.has(donationId)) {
+                            console.log('New donation found by ID, adding to page:', donation);
+                            
+                            // 直接使用API返回的数据，不做任何处理
+                            addNewDonation(donation);
+                            
+                            // 同时更新时间戳，作为备用去重机制
+                            const donationTime = new Date(donation.created_at || donation.CreatedAt || Date.now()).getTime();
+                            if (donationTime > lastDonationTime) {
+                                lastDonationTime = donationTime;
+                            }
+                        } else if (!donationId) {
+                            console.log('Donation has no ID, using time-based check:', donation);
+                            
+                            // 如果没有ID，使用时间判断
+                            const donationTime = new Date(donation.created_at || donation.CreatedAt || Date.now()).getTime();
+                            if (donationTime > lastDonationTime) {
+                                console.log('New donation found by time, adding to page:', donation);
+                                addNewDonation(donation);
+                                lastDonationTime = donationTime;
+                            }
+                        } else {
+                            console.log('Donation already exists, skipping:', donationId);
+                        }
+                    } else {
+                        console.log('Donation does not match current page parameters, skipping:', donation);
+                    }
                 });
+            } else {
+                console.log('No rankings data received:', data);
             }
-            break;
-            
-        default:
-            console.log('未知消息类型:', data.type);
+        })
+        .catch(error => {
+            console.error('Error polling for donations:', error);
+            // 静默处理网络错误，避免日志混乱
+        });
+    */
+}
+
+// 停止HTTP轮询
+function stopPolling() {
+    if (pollingInterval) {
+        clearInterval(pollingInterval);
+        pollingInterval = null;
     }
 }
 
-// ========== 修改7：优化参数匹配逻辑（兼容更多字段） ==========
+
 function checkDonationMatch(donation, params) {
     // 兼容处理：统一转换为字符串
     const paymentParam = params.payment.toString().trim();
@@ -705,13 +1060,24 @@ function checkDonationMatch(donation, params) {
         const donationPaymentText = donation.payment || donation.Payment || '';
         
         // 支持ID匹配（如2）或文本匹配（如wechat/alipay）
-        paymentMatch = (donationPayment === paymentParam) || 
-                       (donationPaymentText === 'wechat' && paymentParam === '2') || 
-                       (donationPaymentText === 'alipay' && paymentParam === '1');
+        paymentMatch = false;
         
-        if (!paymentMatch) {
-            console.error('Payment不匹配:', donationPayment, '/', donationPaymentText, '!==', paymentParam);
+        // 情况1：直接匹配（如ID或文本完全相同）
+        if (donationPayment === paymentParam) {
+            paymentMatch = true;
         }
+        // 情况2：微信支付匹配
+        else if ((donationPaymentText === 'wechat' || donationPayment === '2') && 
+                 (paymentParam === '2' || paymentParam === 'wechat')) {
+            paymentMatch = true;
+        }
+        // 情况3：支付宝匹配
+        else if ((donationPaymentText === 'alipay' || donationPayment === '1') && 
+                 (paymentParam === '1' || paymentParam === 'alipay')) {
+            paymentMatch = true;
+        }
+        
+
     }
     
     // 检查categories参数（兼容多种字段名）
@@ -720,9 +1086,7 @@ function checkDonationMatch(donation, params) {
         const donationCategory = (donation.category_id || donation.CategoryID || donation.categories || donation.Categories || '').toString().trim();
         categoryMatch = donationCategory === categoryParam;
         
-        if (!categoryMatch) {
-            console.error('Categories不匹配:', donationCategory, '!==', categoryParam);
-        }
+
     }
     
     return paymentMatch && categoryMatch;
@@ -730,15 +1094,9 @@ function checkDonationMatch(donation, params) {
 
 // 添加新的捐款记录到页面
 function addNewDonation(donation) {
-    console.log('====================================');
-    console.log('开始添加新捐款记录');
-    console.log('当前时间:', new Date().toISOString());
-    console.log('捐款记录数据:', donation);
-    console.log('====================================');
-    
+    console.log('Adding new donation using API data:', donation);
     const rankingsList = document.getElementById('rankings-list');
     if (!rankingsList) {
-        console.error('未找到rankings-list元素');
         return;
     }
     
@@ -747,55 +1105,74 @@ function addNewDonation(donation) {
         const donationId = (donation.id || donation.ID || '').toString().trim();
         if (donationId) {
             if (donationIds.has(donationId)) {
-                console.log('捐款记录已存在，跳过重复添加:', donationId);
+                console.log('Donation already exists, skipping:', donationId);
                 return;
             }
             // 添加到已存在的ID集合
             donationIds.add(donationId);
-            console.log('捐款记录ID已添加到去重集合:', donationId);
-        } else {
-            console.warn('捐款记录缺少ID字段，无法进行去重检查');
         }
         
         // 兼容处理：获取时间字段（支持驼峰和蛇形命名，处理不同格式）
         let date;
-        const createdAt = donation.created_at || donation.CreatedAt;
-        if (createdAt) {
-            if (typeof createdAt === 'string') {
-                date = new Date(createdAt);
-            } else if (createdAt instanceof Date) {
-                date = createdAt;
-            } else {
-                // 尝试其他时间格式
-                date = new Date(createdAt);
+        let timeStr = donation.created_at || donation.CreatedAt || '';
+        
+        // 尝试多种时间格式解析
+        if (timeStr) {
+            // 首先尝试直接解析
+            date = new Date(timeStr);
+            
+            // 如果解析失败，尝试其他格式
+            if (isNaN(date.getTime())) {
+                // 尝试处理时间戳格式（毫秒）
+                const timestamp = parseInt(timeStr);
+                if (!isNaN(timestamp)) {
+                    // 检查是否是毫秒时间戳（长度大于10）
+                    if (timeStr.length > 10) {
+                        date = new Date(timestamp);
+                    } else {
+                        // 秒时间戳
+                        date = new Date(timestamp * 1000);
+                    }
+                }
             }
-        } else {
+        }
+        
+        // 如果所有尝试都失败，使用当前时间
+        if (!date || isNaN(date.getTime())) {
+            console.error('Invalid date format, using current time:', timeStr);
             date = new Date();
         }
+        
         const formattedDate = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
         const formattedTime = `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}:${String(date.getSeconds()).padStart(2, '0')}`;
-        console.log('捐款时间:', formattedDate, formattedTime);
         
-        // 创建新的功德项
-        const meritItem = document.createElement('div');
-        meritItem.className = 'merit-item';
+        // 直接使用API返回的数据，不做任何处理
+        const amount = donation.amount || donation.Amount || '0';
+        console.log('Using API amount:', amount);
         
-        // 兼容处理：获取其他字段（支持驼峰和蛇形命名）
-        const amount = donation.amount || donation.Amount || 0;
         const payment = donation.payment || donation.Payment || '';
+        console.log('Using API payment:', payment);
+        
         const blessing = donation.blessing || donation.Blessing || '';
+        console.log('Using API blessing:', blessing);
+        
         const avatarUrl = donation.avatar_url || donation.AvatarURL || './static/avatar.jpeg';
-        const userName = donation.user_name || donation.UserName || '匿名施主';
+        console.log('Using API avatar_url:', avatarUrl);
+        
+        const userName = donation.user_name || donation.UserName || donation.username || donation.Username || '匿名施主';
+        console.log('Using API user_name:', userName);
         
         // 构建HTML内容
         const paymentIcon = payment === 'wechat' ? '/static/wechat.png' : '/static/alipay.png';
         const paymentText = payment === 'wechat' ? '微信支付' : '支付宝';
         
-        console.log('构建功德项HTML，金额: ¥' + amount.toFixed(2) + ', 支付方式: ' + paymentText + ', 用户名: ' + userName);
+        // 创建新的功德项
+        const meritItem = document.createElement('div');
+        meritItem.className = 'merit-item';
         
         meritItem.innerHTML = `
             <div style="display: flex; align-items: center; justify-content: space-between; height: 36px;">
-                <div class="merit-amount">¥${amount.toFixed(2)}</div>
+                <div class="merit-amount">¥${amount}</div>
                 <img src="${paymentIcon}" alt="${paymentText}" style="width: 24px; height: 24px; border-radius: 4px; vertical-align: middle;">
             </div>
             ${blessing ? `<div style="font-size: 14px; color: #666; margin: 8px 0;">${blessing}</div>` : ''}
@@ -808,7 +1185,6 @@ function addNewDonation(donation) {
             </div>
         `;
         
-        // ========== 修改8：如果列表为空（无初始数据），直接替换而非插入顶部 ==========
         if (rankingsList.children.length === 0 || (rankingsList.children[0].textContent && rankingsList.children[0].textContent.includes('暂无功德记录'))) {
             rankingsList.innerHTML = '';
             rankingsList.appendChild(meritItem);
@@ -816,25 +1192,163 @@ function addNewDonation(donation) {
             // 添加到列表顶部
             rankingsList.insertBefore(meritItem, rankingsList.firstChild);
         }
-        console.log('功德项添加成功！');
     } catch (error) {
-        console.error('添加新捐款记录失败:', error);
-        console.error('错误堆栈:', error.stack);
+        console.error('Error adding new donation:', error);
+        // 静默处理错误，避免日志混乱
     }
 }
 
-// 初始化WebSocket连接
-function initWebSocket() {
+// 刷新排行榜数据
+function refreshRankings() {
+    console.log('Refreshing rankings...');
+    // 重置状态并重新加载排行榜
+    currentPage = 1;
+    hasMoreData = true;
+    loadRankings(false);
+}
+
+// 插入新的支付记录到数据列最前面
+function insertNewPaymentRecord(data) {
+    console.log('Inserting new payment record:', data);
+    
+    const rankingsList = document.getElementById('rankings-list');
+    if (!rankingsList) {
+        return;
+    }
+    
     try {
-        console.log('====================================');
-        console.log('开始初始化WebSocket连接');
-        console.log('当前时间:', new Date().toISOString());
-        console.log('当前页面参数:', getURLParams());
-        console.log('====================================');
-        connectWebSocket();
+        // 去重检查（与addNewDonation函数保持一致）
+        let donationId = '';
+        // 优先使用id字段
+        if (data.id) {
+            donationId = data.id.toString().trim();
+        } else if (data.ID) {
+            donationId = data.ID.toString().trim();
+        } else if (data.orderNo) {
+            donationId = data.orderNo.toString().trim();
+        } else if (data.OrderNo) {
+            donationId = data.OrderNo.toString().trim();
+        } else if (data.order_id) {
+            donationId = data.order_id.toString().trim();
+        } else if (data.OrderID) {
+            donationId = data.OrderID.toString().trim();
+        }
+        
+        if (donationId && donationIds.has(donationId)) {
+            console.log('Payment record already exists, skipping:', donationId);
+            return;
+        }
+        
+        if (donationId) {
+            donationIds.add(donationId);
+        }
+        
+        // 构建新的支付记录元素
+        const meritItem = document.createElement('div');
+        meritItem.className = 'merit-item';
+        
+        // 为新记录添加特殊背景色（浅红色）
+        meritItem.style.backgroundColor = '#fff0f0';
+        meritItem.style.transition = 'background-color 0.3s ease';
+        
+        // 格式化时间
+        let date;
+        let timeStr = data.created_at || data.CreatedAt || data.Time || '';
+        
+        // 尝试多种时间格式解析
+        if (timeStr) {
+            // 首先尝试直接解析
+            date = new Date(timeStr);
+            
+            // 如果解析失败，尝试其他格式
+            if (isNaN(date.getTime())) {
+                // 尝试处理时间戳格式（毫秒）
+                const timestamp = parseInt(timeStr);
+                if (!isNaN(timestamp)) {
+                    // 检查是否是毫秒时间戳（长度大于10）
+                    if (timeStr.length > 10) {
+                        date = new Date(timestamp);
+                    } else {
+                        // 秒时间戳
+                        date = new Date(timestamp * 1000);
+                    }
+                }
+            }
+        }
+        
+        // 如果所有尝试都失败，使用当前时间
+        if (!date || isNaN(date.getTime())) {
+            console.error('Invalid date format, using current time:', timeStr);
+            date = new Date();
+        }
+        
+        const formattedDate = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+        const formattedTime = `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}:${String(date.getSeconds()).padStart(2, '0')}`;
+        
+        // 确定支付方式图标和文本
+        let payment = data.payment || '';
+        // 直接使用API返回的支付方式，不做任何处理
+        console.log('Using API payment:', payment);
+        const paymentIcon = payment === 'wechat' ? '/static/wechat.png' : '/static/alipay.png';
+        const paymentText = payment === 'wechat' ? '微信支付' : '支付宝';
+        
+        // 确定头像URL（支持多种字段名格式）
+        const avatarUrl = data.avatar_url || data.AvatarURL || './static/avatar.jpeg';
+        console.log('Using API avatar_url:', avatarUrl);
+        
+        // 确定用户名（支持多种字段名格式）
+        const userName = data.user_name || data.UserName || data.username || data.Username || '匿名施主';
+        console.log('Using API user_name:', userName);
+        
+        // 确定祝福语（支持多种字段名格式）
+        const blessing = data.blessing || data.Blessing || '';
+        console.log('Using API blessing:', blessing);
+        
+        // 确定金额
+        // 直接使用API返回的金额，不做任何处理
+        let amount = data.amount || data.Amount || '0';
+        console.log('Using API amount:', amount);
+        
+        // 构建HTML内容（与现有样式保持一致）
+        meritItem.innerHTML = `
+            <div style="display: flex; align-items: center; justify-content: space-between; height: 36px;">
+                <div class="merit-amount">¥${amount}</div>
+                <img src="${paymentIcon}" alt="${paymentText}" style="width: 24px; height: 24px; border-radius: 4px; vertical-align: middle;">
+            </div>
+            ${blessing ? `<div style="font-size: 14px; color: #666; margin: 8px 0;">${blessing}</div>` : ''}
+            <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; margin-top: 8px;">
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <img src="${avatarUrl}" alt="头像" style="width: 32px; height: 32px; border-radius: 8px;">
+                    <span style="font-size: 14px; font-weight: bold;">${userName}</span>
+                </div>
+                <div class="merit-time">${formattedDate} ${formattedTime}</div>
+            </div>
+        `;
+        
+        // 插入到数据列最前面
+        if (rankingsList.children.length === 0 || (rankingsList.children[0].textContent && rankingsList.children[0].textContent.includes('暂无功德记录'))) {
+            rankingsList.innerHTML = '';
+            rankingsList.appendChild(meritItem);
+        } else {
+            rankingsList.insertBefore(meritItem, rankingsList.firstChild);
+        }
+        
+        // 5秒钟后恢复与数据列表相同的背景色
+        setTimeout(() => {
+            meritItem.style.backgroundColor = '';
+        }, 5000);
+        
     } catch (error) {
-        console.error('初始化WebSocket连接失败:', error);
-        // 即使初始化失败，也会在connectWebSocket中自动尝试重连
+        console.error('Error inserting new payment record:', error);
+    }
+}
+
+// 初始化HTTP轮询
+function initPolling() {
+    try {
+        startPolling();
+    } catch (error) {
+        // 静默处理错误，避免日志混乱
     }
 }
 
@@ -842,19 +1356,22 @@ function initWebSocket() {
 function init() {
     // 检查URL参数
     const params = getURLParams();
-    console.log('页面初始化，URL参数:', params);
+    console.log('Init function called with params:', params);
     
     // 处理默认图片容器
     const defaultImageContainer = document.getElementById('default-image-container');
     if (!params.payment) {
+        console.log('No payment parameter, skipping WebSocket connection');
         if (defaultImageContainer) {
             defaultImageContainer.style.display = 'flex';
         }
-        // 没有payment参数，只初始化WebSocket连接和必要的功能
-        initWebSocket();
+        // 没有payment参数，只初始化HTTP轮询和必要的功能
+        initPolling();
         initLazyLoading();
         return;
     }
+    
+    console.log('Payment parameter found:', params.payment);
     
     // 有payment参数，确保默认图片容器隐藏
     if (defaultImageContainer) {
@@ -864,19 +1381,20 @@ function init() {
     // 立即初始化模态窗口，让页面快速显示
     initModal();
     
-    // ========== 修改9：优先初始化WebSocket，避免错过早期广播 ==========
-    initWebSocket();
+    // 优先初始化HTTP轮询，避免错过早期广播
+    initPolling();
+    
+    // 初始化WebSocket连接 - 移到前面，确保优先建立连接
+    console.log('Initializing WebSocket connection...');
+    connectWebSocket();
     
     // 异步加载配置数据（包含分类数据和下拉菜单构建），不阻塞页面显示
     fetchConfigData().then(() => {
-        // 配置数据加载完成后，更新页面标题、二维码和其他标题
+        // 配置加载完成后，更新页面标题、二维码和其他标题
         updatePageTitle();
         updateTitles();
         updateQRCode();
-        // 配置加载完成后，重新发送参数给服务端（防止参数更新）
-        sendClientParamsToServer();
     }).catch(error => {
-        console.error('加载配置数据失败:', error);
         // 即使失败也更新页面标题，使用默认值
         updatePageTitle();
         updateTitles();

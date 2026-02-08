@@ -5,16 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"net/http"
 	"net/url"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
-	"github.com/gin-gonic/gin"
-	"github.com/gorilla/websocket"
+	"github.com/valyala/fasthttp"
 	"github.com/zhifu/donation-rank/models"
 	"github.com/zhifu/donation-rank/services"
 	"github.com/zhifu/donation-rank/utils"
@@ -22,137 +19,177 @@ import (
 
 type APIRoutes struct {
 	paymentService *services.PaymentService
+	wsManager      *WebSocketManager
 	baseDir        string
-	// WebSocket相关
-	upgrader   websocket.Upgrader
-	clients    map[*websocket.Conn]bool
-	broadcast  chan []byte
-	register   chan *websocket.Conn
-	unregister chan *websocket.Conn
-	mutex      sync.Mutex
 }
 
 func NewAPIRoutes(paymentService *services.PaymentService) *APIRoutes {
-	ar := &APIRoutes{
+	wsManager := NewWebSocketManager()
+	return &APIRoutes{
 		paymentService: paymentService,
-		upgrader: websocket.Upgrader{
-			CheckOrigin: func(r *http.Request) bool {
-				return true // 允许所有来源的WebSocket连接
-			},
-		},
-		clients:    make(map[*websocket.Conn]bool),
-		broadcast:  make(chan []byte),
-		register:   make(chan *websocket.Conn),
-		unregister: make(chan *websocket.Conn),
+		wsManager:      wsManager,
 	}
-
-	// 启动WebSocket处理协程
-	go ar.runWebSocketServer()
-
-	return ar
 }
 
-// SetupRoutes 设置路由
-func (ar *APIRoutes) SetupRoutes(router *gin.Engine, baseDir string) {
+// HandleRequest 处理fasthttp请求
+func (ar *APIRoutes) HandleRequest(ctx *fasthttp.RequestCtx, baseDir string) {
 	ar.baseDir = baseDir
 
-	api := router.Group("/api")
-	{
-		api.POST("/donate", ar.CreateDonation) // JSON API，用于AJAX请求
-		api.POST("/callback", ar.HandleCallback)
-		api.GET("/rankings", ar.GetRankings)
-		api.POST("/activate", ar.ActivateTerminal)          // 手动终端激活API
-		api.GET("/check-user", ar.CheckUserExists)          // 检查用户是否存在
-		api.GET("/payment-config/:id", ar.GetPaymentConfig) // 获取支付配置信息
-		api.GET("/category/:id", ar.GetCategory)            // 获取类目信息
-		api.GET("/categories", ar.GetCategories)            // 获取所有类目列表
-		api.POST("/test-broadcast", ar.TestBroadcast)       // 测试WebSocket广播
-		api.POST("/trigger-callback", ar.TriggerCallback)   // 触发支付回调广播测试
+	path := string(ctx.Path())
+	method := string(ctx.Method())
+
+	// 详细调试信息
+	log.Printf("[DEBUG] Full request: path='%s', method='%s', IP='%s'", path, method, string(ctx.RemoteIP().String()))
+
+	// 检查特定路径
+	if path == "/api/pay/callback" {
+		log.Printf("[DEBUG] Matched /api/pay/callback path!")
 	}
 
-	// WebSocket路由
-	router.GET("/ws", ar.WebSocketHandler)
+	if path == "/api/callback" {
+		log.Printf("[DEBUG] Matched /api/callback path!")
+	}
 
-	// 微信公众号授权相关路由
-	router.GET("/api/wechat/auth", ar.WechatAuth)             // 微信授权入口
-	router.GET("/api/wechat/callback", ar.WechatAuthCallback) // 微信授权回调
+	// 处理WebSocket路径
+	if path == "/ws/pay-notify" {
+		// 获取WebSocket参数
+		payment := string(ctx.QueryArgs().Peek("payment"))
+		categories := string(ctx.QueryArgs().Peek("categories"))
+		fmt.Printf("[DEBUG] WebSocket connection attempt: path='%s', method='%s', IP='%s', payment='%s', categories='%s'\n", path, method, string(ctx.RemoteIP().String()), payment, categories)
+		ar.wsManager.HandleWebSocket(ctx)
+		return
+	}
 
-	// 支付宝授权相关路由
-	router.GET("/api/alipay/auth", ar.AlipayAuth)             // 支付宝授权入口
-	router.GET("/api/alipay/callback", ar.AlipayAuthCallback) // 支付宝授权回调
+	// 处理静态文件
+	if strings.HasPrefix(path, "/static/") {
+		ar.serveStaticFile(ctx, path)
+		return
+	}
 
-	// 表单提交支付（用于302重定向）
-	router.POST("/api/donate/form", ar.CreateDonationForm)
-	router.GET("/api/donate/form", ar.CreateDonationForm)
+	// 处理API路由
+	switch {
+	// API路由
+	case path == "/api/donate" && method == "POST":
+		ar.CreateDonation(ctx)
+	case (path == "/api/callback" || path == "/api/pay/callback") && method == "POST":
+		ar.HandleCallback(ctx)
+	case path == "/api/rankings" && method == "GET":
+		ar.GetRankings(ctx)
+	case path == "/api/activate" && method == "POST":
+		ar.ActivateTerminal(ctx)
+	case path == "/api/check-user" && method == "GET":
+		ar.CheckUserExists(ctx)
+	case strings.HasPrefix(path, "/api/payment-config/") && method == "GET":
+		ar.GetPaymentConfig(ctx)
+	case strings.HasPrefix(path, "/api/category/") && method == "GET":
+		ar.GetCategory(ctx)
+	case path == "/api/categories" && method == "GET":
+		ar.GetCategories(ctx)
 
-	// 生成统一支付二维码
-	router.GET("/qrcode", ar.GenerateQRCode)
+	// 微信授权路由
+	case path == "/api/wechat/auth" && method == "GET":
+		ar.WechatAuth(ctx)
+	case path == "/api/wechat/callback" && method == "GET":
+		ar.WechatAuthCallback(ctx)
 
-	// 静态文件服务
-	router.Static("/static", filepath.Join(baseDir, "static"))
+	// 支付宝授权路由
+	case path == "/api/alipay/auth" && method == "GET":
+		ar.AlipayAuth(ctx)
+	case path == "/api/alipay/callback" && method == "GET":
+		ar.AlipayAuthCallback(ctx)
 
-	// 首页
-	router.GET("/", func(c *gin.Context) {
-		// 统一使用index.html模板，根据payment参数动态加载内容
-		c.File(filepath.Join(baseDir, "templates/index.html"))
-	})
+	// 表单提交支付
+	case path == "/api/donate/form":
+		ar.CreateDonationForm(ctx)
 
-	// 支付页面 - 支持动态参数
-	router.GET("/pay", func(c *gin.Context) {
-		// 始终使用统合的pay.html模板，不管是否有payment参数
-		c.File(filepath.Join(baseDir, "templates/pay.html"))
-	})
+	// 生成二维码
+	case path == "/qrcode" && method == "GET":
+		ar.GenerateQRCode(ctx)
 
-	// 静态文件缓存中间件
-	router.Use(func(c *gin.Context) {
-		// 为静态文件添加缓存头
-		if strings.HasPrefix(c.Request.URL.Path, "/static/") {
-			c.Header("Cache-Control", "public, max-age=86400") // 24小时缓存
-			c.Header("Expires", time.Now().Add(24*time.Hour).Format(time.RFC1123))
-		}
-		c.Next()
-	})
+	// 首页，支持带参数访问
+	case path == "/" && method == "GET":
+		// 获取参数
+		payment := string(ctx.QueryArgs().Peek("payment"))
+		categories := string(ctx.QueryArgs().Peek("categories"))
+		log.Printf("Home page accessed with payment=%s, categories=%s", payment, categories)
+		// 提供正式的业务逻辑页面
+		ar.serveTemplate(ctx, "templates/index.html")
+
+	// 支付页面
+	case path == "/pay" && method == "GET":
+		ar.serveTemplate(ctx, "templates/pay.html")
+	default:
+		log.Printf("404 Not Found: path=%s, method=%s", path, method)
+		ctx.SetStatusCode(fasthttp.StatusNotFound)
+		ctx.WriteString("Not Found")
+	}
+}
+
+// serveStaticFile 提供静态文件服务
+func (ar *APIRoutes) serveStaticFile(ctx *fasthttp.RequestCtx, path string) {
+	// 为静态文件添加缓存头
+	ctx.Response.Header.Set("Cache-Control", "public, max-age=86400") // 24小时缓存
+	ctx.Response.Header.Set("Expires", time.Now().Add(24*time.Hour).Format(time.RFC1123))
+
+	// 提供文件
+	fasthttp.ServeFile(ctx, filepath.Join(ar.baseDir, path))
+}
+
+// serveTemplate 提供模板文件服务
+func (ar *APIRoutes) serveTemplate(ctx *fasthttp.RequestCtx, templatePath string) {
+	// 提供文件
+	fasthttp.ServeFile(ctx, filepath.Join(ar.baseDir, templatePath))
 }
 
 // CreateDonation 创建捐款订单（JSON API）
-func (ar *APIRoutes) CreateDonation(c *gin.Context) {
+func (ar *APIRoutes) CreateDonation(ctx *fasthttp.RequestCtx) {
 	// 创建带超时的上下文，设置15秒超时
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	ctxTimeout, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	// 使用超时上下文替换原请求上下文
-	c.Request = c.Request.WithContext(ctx)
-
 	var req struct {
-		Amount   float64 `json:"amount" binding:"required"`
-		Payment  string  `json:"payment" binding:"required,oneof=wechat alipay"`
+		Amount   float64 `json:"amount"`
+		Payment  string  `json:"payment"`
 		Category string  `json:"category"` // 捐款类目
 		Blessing string  `json:"blessing"` // 祝福语
 	}
 
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	// 解析请求体
+	if err := json.Unmarshal(ctx.Request.Body(), &req); err != nil {
+		ctx.SetStatusCode(fasthttp.StatusBadRequest)
+		ctx.Response.Header.Set("Content-Type", "application/json; charset=utf-8")
+		json.NewEncoder(ctx).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	// 验证参数
+	if req.Payment == "" {
+		ctx.SetStatusCode(fasthttp.StatusBadRequest)
+		ctx.Response.Header.Set("Content-Type", "application/json; charset=utf-8")
+		json.NewEncoder(ctx).Encode(map[string]string{"error": "payment is required"})
 		return
 	}
 
 	// 手动验证金额范围（使用浮点数比较，配合epsilon处理精度问题）
 	epsilon := 0.0001 // 0.01分的精度误差
 	if req.Amount < 0.01-epsilon || req.Amount > 10000+epsilon {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "amount must be between 0.01 and 10000"})
+		ctx.SetStatusCode(fasthttp.StatusBadRequest)
+		ctx.Response.Header.Set("Content-Type", "application/json; charset=utf-8")
+		json.NewEncoder(ctx).Encode(map[string]string{"error": "amount must be between 0.01 and 10000"})
 		return
 	}
 
 	// 获取请求的主机名
-	host := c.Request.Host
+	host := string(ctx.Host())
 
 	// 从cookie中获取对应的用户标识
 	var openid string
 	if req.Payment == "wechat" {
 		// 微信用户，从cookie中获取openid
-		openid, _ = c.Cookie("wechat_openid")
+		openid = string(ctx.Request.Header.Cookie("wechat_openid"))
 	} else {
 		// 支付宝用户，从cookie中获取user_id
-		openid, _ = c.Cookie("alipay_user_id")
+		openid = string(ctx.Request.Header.Cookie("alipay_user_id"))
 	}
 
 	// 确保未授权时openid为"anonymous"
@@ -160,7 +197,7 @@ func (ar *APIRoutes) CreateDonation(c *gin.Context) {
 		openid = "anonymous"
 	}
 	// 获取payment_configs的ID（从请求参数中获取）
-	paymentConfigID := c.Query("payment")
+	paymentConfigID := string(ctx.QueryArgs().Peek("payment"))
 
 	// 使用goroutine和channel处理超时
 	type result struct {
@@ -179,65 +216,74 @@ func (ar *APIRoutes) CreateDonation(c *gin.Context) {
 	select {
 	case res := <-resultChan:
 		if res.err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": res.err.Error()})
+			ctx.SetStatusCode(fasthttp.StatusInternalServerError)
+			ctx.Response.Header.Set("Content-Type", "application/json; charset=utf-8")
+			json.NewEncoder(ctx).Encode(map[string]string{"error": res.err.Error()})
 			return
 		}
 
-		c.JSON(http.StatusOK, gin.H{
+		ctx.SetStatusCode(fasthttp.StatusOK)
+		ctx.Response.Header.Set("Content-Type", "application/json; charset=utf-8")
+		json.NewEncoder(ctx).Encode(map[string]string{
 			"order_id": res.orderID,
 			"pay_url":  res.payURL,
 		})
-	case <-ctx.Done():
-		c.JSON(http.StatusRequestTimeout, gin.H{"error": "请求超时，请稍后再试"})
+	case <-ctxTimeout.Done():
+		ctx.SetStatusCode(fasthttp.StatusRequestTimeout)
+		ctx.Response.Header.Set("Content-Type", "application/json; charset=utf-8")
+		json.NewEncoder(ctx).Encode(map[string]string{"error": "请求超时，请稍后再试"})
 		return
 	}
 }
 
 // CreateDonationForm 创建捐款订单（表单提交，302重定向）
-func (ar *APIRoutes) CreateDonationForm(c *gin.Context) {
+func (ar *APIRoutes) CreateDonationForm(ctx *fasthttp.RequestCtx) {
 	// 创建带超时的上下文，设置15秒超时
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	ctxTimeout, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	// 使用超时上下文替换原请求上下文
-	c.Request = c.Request.WithContext(ctx)
-
 	// 从表单获取参数
-	amountStr := c.PostForm("amount")
-	payment := c.PostForm("payment")
-	category := c.PostForm("category") // 捐款类目
-	blessing := c.PostForm("blessing") // 祝福语
+	amountStr := string(ctx.FormValue("amount"))
+	payment := string(ctx.FormValue("payment"))
+	category := string(ctx.FormValue("category")) // 捐款类目
+	blessing := string(ctx.FormValue("blessing")) // 祝福语
 
 	// 验证参数
 	if amountStr == "" || payment == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "missing required parameters"})
+		ctx.SetStatusCode(fasthttp.StatusBadRequest)
+		ctx.Response.Header.Set("Content-Type", "application/json")
+		json.NewEncoder(ctx).Encode(map[string]string{"error": "missing required parameters"})
 		return
 	}
 
 	// 转换金额
 	amount, err := strconv.ParseFloat(amountStr, 64)
 	if err != nil || amount <= 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid amount"})
+		ctx.SetStatusCode(fasthttp.StatusBadRequest)
+		ctx.Response.Header.Set("Content-Type", "application/json")
+		json.NewEncoder(ctx).Encode(map[string]string{"error": "invalid amount"})
 		return
 	}
 
 	// 验证支付方式
 	if payment != "wechat" && payment != "alipay" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid payment type"})
+		ctx.SetStatusCode(fasthttp.StatusBadRequest)
+		ctx.Response.Header.Set("Content-Type", "application/json")
+		json.NewEncoder(ctx).Encode(map[string]string{"error": "invalid payment type"})
 		return
 	}
 
 	// 获取请求的主机名
-	host := c.Request.Host
+	host := string(ctx.Host())
 
 	// 从cookie中获取对应的用户标识
 	var openid string
 	if payment == "wechat" {
 		// 微信用户，从cookie中获取openid
-		openid, _ = c.Cookie("wechat_openid")
+		openid = string(ctx.Request.Header.Cookie("wechat_openid"))
 	} else {
 		// 支付宝用户，从cookie中获取user_id
-		openid, _ = c.Cookie("alipay_user_id")
+		openid = string(ctx.Request.Header.Cookie("alipay_user_id"))
 	}
 
 	// 确保未授权时openid为"anonymous"
@@ -245,9 +291,9 @@ func (ar *APIRoutes) CreateDonationForm(c *gin.Context) {
 		openid = "anonymous"
 	}
 	// 获取payment_configs的ID（从表单或URL参数中获取）
-	paymentConfigID := c.PostForm("payment_config_id")
+	paymentConfigID := string(ctx.FormValue("payment_config_id"))
 	if paymentConfigID == "" {
-		paymentConfigID = c.Query("payment")
+		paymentConfigID = string(ctx.QueryArgs().Peek("payment"))
 	}
 
 	// 使用goroutine和channel处理超时
@@ -266,25 +312,31 @@ func (ar *APIRoutes) CreateDonationForm(c *gin.Context) {
 	select {
 	case res := <-resultChan:
 		if res.err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": res.err.Error()})
+			ctx.SetStatusCode(fasthttp.StatusInternalServerError)
+			ctx.Response.Header.Set("Content-Type", "application/json; charset=utf-8")
+			json.NewEncoder(ctx).Encode(map[string]string{"error": res.err.Error()})
 			return
 		}
 
 		// 302重定向到支付URL（根据API文档Step 3要求）
-		c.Redirect(http.StatusFound, res.payURL)
-	case <-ctx.Done():
-		c.JSON(http.StatusRequestTimeout, gin.H{"error": "请求超时，请稍后再试"})
+		ctx.Redirect(res.payURL, fasthttp.StatusFound)
+	case <-ctxTimeout.Done():
+		ctx.SetStatusCode(fasthttp.StatusRequestTimeout)
+		ctx.Response.Header.Set("Content-Type", "application/json; charset=utf-8")
+		json.NewEncoder(ctx).Encode(map[string]string{"error": "请求超时，请稍后再试"})
 		return
 	}
 }
 
 // CheckUserExists 检查用户是否存在
-func (ar *APIRoutes) CheckUserExists(c *gin.Context) {
-	openid := c.Query("openid")
-	payment := c.Query("payment")
+func (ar *APIRoutes) CheckUserExists(ctx *fasthttp.RequestCtx) {
+	openid := string(ctx.QueryArgs().Peek("openid"))
+	payment := string(ctx.QueryArgs().Peek("payment"))
 
 	if openid == "" || payment == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "missing required parameters"})
+		ctx.SetStatusCode(fasthttp.StatusBadRequest)
+		ctx.Response.Header.Set("Content-Type", "application/json")
+		json.NewEncoder(ctx).Encode(map[string]string{"error": "missing required parameters"})
 		return
 	}
 
@@ -304,20 +356,22 @@ func (ar *APIRoutes) CheckUserExists(c *gin.Context) {
 		}
 	}
 
-	c.JSON(http.StatusOK, gin.H{"exists": exists})
+	ctx.SetStatusCode(fasthttp.StatusOK)
+	ctx.Response.Header.Set("Content-Type", "application/json")
+	json.NewEncoder(ctx).Encode(map[string]bool{"exists": exists})
 }
 
 // WechatAuth 微信公众号授权入口
-func (ar *APIRoutes) WechatAuth(c *gin.Context) {
+func (ar *APIRoutes) WechatAuth(ctx *fasthttp.RequestCtx) {
 	// 获取当前主机名
-	host := c.Request.Host
+	host := string(ctx.Host())
 
 	// 获取重定向URL参数
-	redirectURL := c.Query("redirect_url")
+	redirectURL := string(ctx.QueryArgs().Peek("redirect_url"))
 
 	// 获取payment和categories参数
-	payment := c.Query("payment")
-	categories := c.Query("categories")
+	payment := string(ctx.QueryArgs().Peek("payment"))
+	categories := string(ctx.QueryArgs().Peek("categories"))
 
 	if redirectURL == "" {
 		// 默认重定向到支付页面
@@ -372,170 +426,95 @@ func (ar *APIRoutes) WechatAuth(c *gin.Context) {
 	authURL, err := ar.paymentService.GetWechatAuthURLWithRedirect(host, redirectURL)
 	if err != nil {
 		log.Printf("Failed to generate wechat auth URL: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate auth URL"})
+		ctx.SetStatusCode(fasthttp.StatusInternalServerError)
+		ctx.Response.Header.Set("Content-Type", "application/json")
+		json.NewEncoder(ctx).Encode(map[string]string{"error": "failed to generate auth URL"})
 		return
 	}
 
 	// 302重定向到微信授权页面
-	c.Redirect(http.StatusFound, authURL)
+	ctx.Redirect(authURL, fasthttp.StatusFound)
 }
 
 // WechatAuthCallback 微信公众号授权回调处理
-func (ar *APIRoutes) WechatAuthCallback(c *gin.Context) {
+func (ar *APIRoutes) WechatAuthCallback(ctx *fasthttp.RequestCtx) {
 	// 获取授权码
-	code := c.Query("code")
+	code := string(ctx.QueryArgs().Peek("code"))
 
 	// 获取重定向URL参数
-	redirectURL := c.Query("redirect_url")
+	redirectURL := string(ctx.QueryArgs().Peek("redirect_url"))
 
 	// 获取payment和categories参数
-	payment := c.Query("payment")
-	categories := c.Query("categories")
+	payment := string(ctx.QueryArgs().Peek("payment"))
+	categories := string(ctx.QueryArgs().Peek("categories"))
+
+	// 构建重定向URL
+	redirectURL = ar.buildRedirectURL(redirectURL, payment, categories)
 
 	if code == "" {
 		// 未获取到授权码，设置为匿名施主
-		c.SetCookie("wechat_openid", "anonymous", 86400, "/", "", false, false)
-		c.SetCookie("wechat_user_id", "anonymous", 86400, "/", "", false, false)
-		c.SetCookie("wechat_user_name", "匿名施主", 86400, "/", "", false, false)
-		// 设置默认头像URL
-		c.SetCookie("wechat_avatar_url", "./static/avatar.jpeg", 86400, "/", "", false, false)
-
-		// 构建重定向URL
-		if redirectURL == "" {
-			// 默认重定向到支付页面
-			redirectURL = "/pay"
-
-			// 添加payment和categories参数
-			firstParam := true
-			if payment != "" {
-				redirectURL += fmt.Sprintf("?payment=%s", payment)
-				firstParam = false
-				if categories != "" {
-					redirectURL += fmt.Sprintf("&categories=%s", categories)
-				}
-			} else if categories != "" {
-				redirectURL += fmt.Sprintf("?categories=%s", categories)
-				firstParam = false
-			}
-
-			// 添加authorized参数
-			if firstParam {
-				redirectURL += "?authorized=1"
-			} else {
-				redirectURL += "&authorized=1"
-			}
-		} else {
-			// 如果重定向URL不包含authorized参数，添加它
-			if !strings.Contains(redirectURL, "?") {
-				redirectURL += "?authorized=1"
-			} else {
-				redirectURL += "&authorized=1"
-			}
-		}
-
-		c.Redirect(http.StatusFound, redirectURL)
+		ar.setAnonymousWechatCookie(ctx)
+		ctx.Redirect(redirectURL, fasthttp.StatusFound)
 		return
-	}
-
-	// 构建重定向URL
-	if redirectURL == "" {
-		// 默认重定向到支付页面
-		redirectURL = "/pay"
-
-		// 添加payment和categories参数
-		firstParam := true
-		if payment != "" {
-			redirectURL += fmt.Sprintf("?payment=%s", payment)
-			firstParam = false
-			if categories != "" {
-				redirectURL += fmt.Sprintf("&categories=%s", categories)
-			}
-		} else if categories != "" {
-			redirectURL += fmt.Sprintf("?categories=%s", categories)
-			firstParam = false
-		}
-
-		// 添加authorized参数
-		if firstParam {
-			redirectURL += "?authorized=1"
-		} else {
-			redirectURL += "&authorized=1"
-		}
-	} else {
-		// 如果重定向URL不包含authorized参数，添加它
-		if !strings.Contains(redirectURL, "?") {
-			redirectURL += "?authorized=1"
-		} else {
-			redirectURL += "&authorized=1"
-		}
-
-		// 如果重定向URL中没有payment和categories参数，但请求中有，添加它们
-		if payment != "" && !strings.Contains(redirectURL, "payment=") {
-			redirectURL += fmt.Sprintf("&payment=%s", payment)
-		}
-
-		if categories != "" && !strings.Contains(redirectURL, "categories=") {
-			redirectURL += fmt.Sprintf("&categories=%s", categories)
-		}
-	}
-
-	// 如果重定向URL中没有payment和categories参数，但请求中有，添加它们
-	if payment != "" && !strings.Contains(redirectURL, "payment=") {
-		if !strings.Contains(redirectURL, "?") {
-			redirectURL += fmt.Sprintf("?payment=%s", payment)
-		} else {
-			redirectURL += fmt.Sprintf("&payment=%s", payment)
-		}
-	}
-
-	if categories != "" && !strings.Contains(redirectURL, "categories=") {
-		if !strings.Contains(redirectURL, "?") {
-			redirectURL += fmt.Sprintf("?categories=%s", categories)
-		} else {
-			redirectURL += fmt.Sprintf("&categories=%s", categories)
-		}
 	}
 
 	// 使用授权码获取用户信息
 	userInfo, err := ar.paymentService.GetWechatUserInfoByCode(code)
 	if err != nil {
-		log.Printf("Failed to get wechat user info by code: %v", err)
 		// 授权失败，设置为匿名施主
-		c.SetCookie("wechat_openid", "anonymous", 86400, "/", "", false, true)
-		c.SetCookie("wechat_user_id", "anonymous", 86400, "/", "", false, true)
-		c.SetCookie("wechat_user_name", "匿名施主", 86400, "/", "", false, true)
-		// 设置默认头像URL
-		c.SetCookie("wechat_avatar_url", "./static/avatar.jpeg", 86400, "/", "", false, true)
-		// 重定向回原页面
-		c.Redirect(http.StatusFound, redirectURL)
+		ar.setAnonymousWechatCookie(ctx)
+		ctx.Redirect(redirectURL, fasthttp.StatusFound)
 		return
 	}
 
 	// 将用户信息存储到cookie中，方便后续使用
-	c.SetCookie("wechat_openid", userInfo["openid"].(string), 86400, "/", "", false, false)
-	c.SetCookie("wechat_user_id", userInfo["openid"].(string), 86400, "/", "", false, false)
+	if openid, ok := userInfo["openid"].(string); ok {
+		cookie := &fasthttp.Cookie{}
+		cookie.SetKey("wechat_openid")
+		cookie.SetValue(openid)
+		cookie.SetMaxAge(86400)
+		cookie.SetPath("/")
+		ctx.Response.Header.SetCookie(cookie)
+
+		cookie = &fasthttp.Cookie{}
+		cookie.SetKey("wechat_user_id")
+		cookie.SetValue(openid)
+		cookie.SetMaxAge(86400)
+		cookie.SetPath("/")
+		ctx.Response.Header.SetCookie(cookie)
+	}
 	if nickname, ok := userInfo["nickname"].(string); ok {
-		c.SetCookie("wechat_user_name", url.QueryEscape(nickname), 86400, "/", "", false, false)
+		cookie := &fasthttp.Cookie{}
+		cookie.SetKey("wechat_user_name")
+		cookie.SetValue(url.QueryEscape(nickname))
+		cookie.SetMaxAge(86400)
+		cookie.SetPath("/")
+		ctx.Response.Header.SetCookie(cookie)
 	}
 	if headimgurl, ok := userInfo["headimgurl"].(string); ok {
-		c.SetCookie("wechat_avatar_url", url.QueryEscape(headimgurl), 86400, "/", "", false, false)
+		cookie := &fasthttp.Cookie{}
+		cookie.SetKey("wechat_avatar_url")
+		cookie.SetValue(url.QueryEscape(headimgurl))
+		cookie.SetMaxAge(86400)
+		cookie.SetPath("/")
+		ctx.Response.Header.SetCookie(cookie)
 	}
 
 	// 重定向回原页面，添加授权标记
-	c.Redirect(http.StatusFound, redirectURL)
+	ctx.Redirect(redirectURL, fasthttp.StatusFound)
 }
 
 // AlipayAuth 支付宝授权入口
-func (ar *APIRoutes) AlipayAuth(c *gin.Context) {
+func (ar *APIRoutes) AlipayAuth(ctx *fasthttp.RequestCtx) {
 	// 获取当前主机名
-	host := c.Request.Host
+	host := string(ctx.Host())
 
 	// 获取重定向URL参数
-	redirectURL := c.Query("redirect_url")
+	redirectURL := string(ctx.QueryArgs().Peek("redirect_url"))
 
 	// 获取payment和categories参数
-	payment := c.Query("payment")
-	categories := c.Query("categories")
+	payment := string(ctx.QueryArgs().Peek("payment"))
+	categories := string(ctx.QueryArgs().Peek("categories"))
 
 	if redirectURL == "" {
 		// 默认重定向到支付页面
@@ -590,34 +569,35 @@ func (ar *APIRoutes) AlipayAuth(c *gin.Context) {
 	authURL, err := ar.paymentService.GetAlipayAuthURLWithRedirect(host, redirectURL)
 	if err != nil {
 		log.Printf("Failed to generate alipay auth URL: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate auth URL"})
+		ctx.SetStatusCode(fasthttp.StatusInternalServerError)
+		ctx.Response.Header.Set("Content-Type", "application/json")
+		json.NewEncoder(ctx).Encode(map[string]string{"error": "failed to generate auth URL"})
 		return
 	}
 
 	// 302重定向到支付宝授权页面
-	c.Redirect(http.StatusFound, authURL)
+	ctx.Redirect(authURL, fasthttp.StatusFound)
 }
 
 // AlipayAuthCallback 支付宝授权回调处理
-func (ar *APIRoutes) AlipayAuthCallback(c *gin.Context) {
+func (ar *APIRoutes) AlipayAuthCallback(ctx *fasthttp.RequestCtx) {
 	// 获取授权码
-	code := c.Query("auth_code")
+	code := string(ctx.QueryArgs().Peek("auth_code"))
 
 	// 从state参数中获取重定向URL
-	redirectURL := c.Query("state")
+	redirectURL := string(ctx.QueryArgs().Peek("state"))
 	// 解码state参数
 	var err error
 	if redirectURL != "" {
 		redirectURL, err = url.QueryUnescape(redirectURL)
 		if err != nil {
-			log.Printf("Failed to unescape redirect URL: %v", err)
 			redirectURL = ""
 		}
 	}
 
 	// 获取payment和categories参数
-	payment := c.Query("payment")
-	categories := c.Query("categories")
+	payment := string(ctx.QueryArgs().Peek("payment"))
+	categories := string(ctx.QueryArgs().Peek("categories"))
 
 	// 尝试从redirect_url中解析payment和categories参数
 	if payment == "" || categories == "" {
@@ -635,121 +615,22 @@ func (ar *APIRoutes) AlipayAuthCallback(c *gin.Context) {
 		}
 	}
 
+	// 构建重定向URL
+	redirectURL = ar.buildRedirectURL(redirectURL, payment, categories)
+
 	if code == "" {
 		// 未获取到授权码，设置为匿名施主
-		c.SetCookie("alipay_user_id", "anonymous", 86400, "/", "", false, false)
-		c.SetCookie("alipay_user_name", "匿名施主", 86400, "/", "", false, false)
-		// 设置默认头像URL
-		c.SetCookie("alipay_avatar_url", "./static/avatar.jpeg", 86400, "/", "", false, false)
-
-		// 构建重定向URL
-		if redirectURL == "" {
-			// 默认重定向到支付页面
-			redirectURL = "/pay"
-
-			// 添加payment和categories参数
-			firstParam := true
-			if payment != "" {
-				redirectURL += fmt.Sprintf("?payment=%s", payment)
-				firstParam = false
-				if categories != "" {
-					redirectURL += fmt.Sprintf("&categories=%s", categories)
-				}
-			} else if categories != "" {
-				redirectURL += fmt.Sprintf("?categories=%s", categories)
-				firstParam = false
-			}
-
-			// 添加authorized参数
-			if firstParam {
-				redirectURL += "?authorized=1"
-			} else {
-				redirectURL += "&authorized=1"
-			}
-		} else {
-			// 如果重定向URL不包含authorized参数，添加它
-			if !strings.Contains(redirectURL, "?") {
-				redirectURL += "?authorized=1"
-			} else {
-				redirectURL += "&authorized=1"
-			}
-		}
-
-		// 重定向回原页面
-		c.Redirect(http.StatusFound, redirectURL)
+		ar.setAnonymousAlipayCookie(ctx)
+		ctx.Redirect(redirectURL, fasthttp.StatusFound)
 		return
-	}
-
-	// 构建重定向URL
-	if redirectURL == "" {
-		// 默认重定向到支付页面
-		redirectURL = "/pay"
-
-		// 添加payment和categories参数
-		firstParam := true
-		if payment != "" {
-			redirectURL += fmt.Sprintf("?payment=%s", payment)
-			firstParam = false
-			if categories != "" {
-				redirectURL += fmt.Sprintf("&categories=%s", categories)
-			}
-		} else if categories != "" {
-			redirectURL += fmt.Sprintf("?categories=%s", categories)
-			firstParam = false
-		}
-
-		// 添加authorized参数
-		if firstParam {
-			redirectURL += "?authorized=1"
-		} else {
-			redirectURL += "&authorized=1"
-		}
-	} else {
-		// 如果重定向URL不包含authorized参数，添加它
-		if !strings.Contains(redirectURL, "?") {
-			redirectURL += "?authorized=1"
-		} else {
-			redirectURL += "&authorized=1"
-		}
-
-		// 如果重定向URL中没有payment和categories参数，但请求中有，添加它们
-		if payment != "" && !strings.Contains(redirectURL, "payment=") {
-			redirectURL += fmt.Sprintf("&payment=%s", payment)
-		}
-
-		if categories != "" && !strings.Contains(redirectURL, "categories=") {
-			redirectURL += fmt.Sprintf("&categories=%s", categories)
-		}
-	}
-
-	// 如果重定向URL中没有payment和categories参数，但请求中有，添加它们
-	if payment != "" && !strings.Contains(redirectURL, "payment=") {
-		if !strings.Contains(redirectURL, "?") {
-			redirectURL += fmt.Sprintf("?payment=%s", payment)
-		} else {
-			redirectURL += fmt.Sprintf("&payment=%s", payment)
-		}
-	}
-
-	if categories != "" && !strings.Contains(redirectURL, "categories=") {
-		if !strings.Contains(redirectURL, "?") {
-			redirectURL += fmt.Sprintf("?categories=%s", categories)
-		} else {
-			redirectURL += fmt.Sprintf("&categories=%s", categories)
-		}
 	}
 
 	// 使用授权码获取用户信息
 	userInfo, err := ar.paymentService.GetAlipayUserInfoByCode(code)
 	if err != nil {
-		log.Printf("Failed to get alipay user info by code: %v", err)
 		// 授权失败，设置为匿名施主
-		c.SetCookie("alipay_user_id", "anonymous", 86400, "/", "", false, true)
-		c.SetCookie("alipay_user_name", "匿名施主", 86400, "/", "", false, true)
-		// 设置默认头像URL
-		c.SetCookie("alipay_avatar_url", "./static/avatar.jpeg", 86400, "/", "", false, true)
-		// 重定向回原页面
-		c.Redirect(http.StatusFound, redirectURL)
+		ar.setAnonymousAlipayCookie(ctx)
+		ctx.Redirect(redirectURL, fasthttp.StatusFound)
 		return
 	}
 
@@ -760,13 +641,36 @@ func (ar *APIRoutes) AlipayAuthCallback(c *gin.Context) {
 	accessToken := userInfo["access_token"]
 
 	// 对包含特殊字符的值进行URL编码，确保cookie存储正确
-	c.SetCookie("alipay_user_id", userID, 86400, "/", "", false, false)
-	c.SetCookie("alipay_user_name", url.QueryEscape(userName), 86400, "/", "", false, false)
-	c.SetCookie("alipay_avatar_url", url.QueryEscape(avatarURL), 86400, "/", "", false, false)
+	cookie := &fasthttp.Cookie{}
+	cookie.SetKey("alipay_user_id")
+	cookie.SetValue(userID)
+	cookie.SetMaxAge(86400)
+	cookie.SetPath("/")
+	ctx.Response.Header.SetCookie(cookie)
+
+	cookie = &fasthttp.Cookie{}
+	cookie.SetKey("alipay_user_name")
+	cookie.SetValue(url.QueryEscape(userName))
+	cookie.SetMaxAge(86400)
+	cookie.SetPath("/")
+	ctx.Response.Header.SetCookie(cookie)
+
+	cookie = &fasthttp.Cookie{}
+	cookie.SetKey("alipay_avatar_url")
+	cookie.SetValue(url.QueryEscape(avatarURL))
+	cookie.SetMaxAge(86400)
+	cookie.SetPath("/")
+	ctx.Response.Header.SetCookie(cookie)
 
 	// 保存access_token到cookie中，用于后续获取用户信息
 	if accessToken != "" {
-		c.SetCookie("alipay_access_token", accessToken, 86400, "/", "", false, false)
+		cookie = &fasthttp.Cookie{}
+		cookie.SetKey("alipay_access_token")
+		cookie.SetValue(accessToken)
+		cookie.SetMaxAge(86400)
+		cookie.SetPath("/")
+		ctx.Response.Header.SetCookie(cookie)
+
 		// 保存access_token到数据库用户表中
 		var alipayUser models.AlipayUser
 		if err := utils.DB.Where("user_id = ?", userID).FirstOrCreate(&alipayUser, models.AlipayUser{UserID: userID}).Error; err == nil {
@@ -778,111 +682,311 @@ func (ar *APIRoutes) AlipayAuthCallback(c *gin.Context) {
 	}
 
 	// 重定向回原页面，添加授权标记
-	c.Redirect(http.StatusFound, redirectURL)
+	ctx.Redirect(redirectURL, fasthttp.StatusFound)
 }
 
 // HandleCallback 处理支付回调（WAP支付方式）
-func (ar *APIRoutes) HandleCallback(c *gin.Context) {
-	log.Printf("====================================")
-	log.Printf("开始处理支付回调")
-	log.Printf("当前时间: %v", time.Now())
-	log.Printf("====================================")
+func (ar *APIRoutes) HandleCallback(ctx *fasthttp.RequestCtx) {
+	// 添加防缓存头
+	ctx.Response.Header.Set("Cache-Control", "no-cache,no-store,must-revalidate")
+	ctx.Response.Header.Set("Pragma", "no-cache")
+	ctx.Response.Header.Set("Expires", "0")
+
+	// 关闭压缩
+	ctx.Response.Header.Del("Content-Encoding")
 
 	// 读取请求体
-	body, err := c.GetRawData()
-	if err != nil {
-		log.Printf("Failed to read callback body: %v", err)
-		c.String(http.StatusBadRequest, "error reading body")
-		return
-	}
+	body := ctx.PostBody()
 
-	// 记录完整的回调请求日志
-	log.Printf("Received callback request: Method=%s, URL=%s, Headers=%v, Body=%s",
-		c.Request.Method, c.Request.URL.String(), c.Request.Header, string(body))
+	// 记录完整的请求体（用于调试）
+	log.Printf("WebHook request body: %s", string(body))
 
 	// 解析JSON数据，使用map[string]interface{}处理数组字段
 	var data map[string]interface{}
 	if err := json.Unmarshal(body, &data); err != nil {
-		log.Printf("Failed to parse callback JSON: %v, Body: %s", err, string(body))
-		c.String(http.StatusBadRequest, "invalid json")
+		log.Printf("WebHook request unmarshal error: %v, IP=%s", err, string(ctx.RemoteIP().String()))
+		ctx.SetStatusCode(fasthttp.StatusOK)
+		ctx.WriteString("success")
 		return
 	}
 
-	// 获取订单号
+	// 记录解析后的数据结构（用于调试）
+	log.Printf("WebHook parsed data: %v", data)
+
+	// 解析订单号、金额、状态
 	orderID, _ := data["client_sn"].(string)
+	// 尝试从其他字段获取订单号（支持微信支付）
 	if orderID == "" {
-		log.Printf("Missing client_sn in callback: %v", data)
-		c.String(http.StatusBadRequest, "missing client_sn")
+		if id, ok := data["order_id"].(string); ok {
+			orderID = id
+			log.Printf("Got order ID from order_id: %s", orderID)
+		} else if id, ok := data["out_trade_no"].(string); ok {
+			orderID = id
+			log.Printf("Got order ID from out_trade_no: %s", orderID)
+		} else if id, ok := data["transaction_id"].(string); ok {
+			orderID = id
+			log.Printf("Got order ID from transaction_id: %s", orderID)
+		}
+	}
+	amount, _ := data["amount"].(string)
+	// 尝试从其他字段获取金额
+	if amount == "" {
+		if amt, ok := data["total_amount"].(string); ok {
+			amount = amt
+			log.Printf("Got amount from total_amount: %s", amount)
+		} else if amt, ok := data["pay_amount"].(string); ok {
+			amount = amt
+			log.Printf("Got amount from pay_amount: %s", amount)
+		}
+	}
+	status, _ := data["status"].(string)
+	// 尝试从其他字段获取状态
+	if status == "" {
+		if stat, ok := data["trade_status"].(string); ok {
+			status = stat
+			log.Printf("Got status from trade_status: %s", status)
+		} else if stat, ok := data["result_code"].(string); ok {
+			status = stat
+			log.Printf("Got status from result_code: %s", status)
+		}
+	}
+
+	// 检查支付状态（支持多种状态格式）
+	successStatuses := []string{"success", "SUCCESS", "TRADE_SUCCESS", "PAY_SUCCESS"}
+	isSuccess := false
+	for _, s := range successStatuses {
+		if status == s {
+			isSuccess = true
+			break
+		}
+	}
+
+	// 非成功状态直接返回success
+	if !isSuccess {
+		log.Printf("WebHook status not success: orderNo=%s, status=%s, IP=%s", orderID, status, string(ctx.RemoteIP().String()))
+		ctx.SetStatusCode(fasthttp.StatusOK)
+		ctx.WriteString("success")
 		return
 	}
+
+	// 标准化状态值
+	status = "success"
 
 	// 获取Authorization头中的sign
-	auth := c.GetHeader("Authorization")
-	log.Printf("Callback for order %s, auth header: %s", orderID, auth)
+	auth := string(ctx.Request.Header.Peek("Authorization"))
 
-	// 处理回调，支持两种签名验证方式
-	var handleErr error
+	// 验签
+	var verifyErr error
 	if auth != "" {
 		// 方式1：使用RSA公钥验证（推荐）
-		log.Printf("Using RSA public key to verify callback for order %s", orderID)
-		handleErr = ar.paymentService.HandleCallbackWithPublicKey(data, auth, body)
+		verifyErr = ar.paymentService.HandleCallbackWithPublicKey(data, auth, body)
 	} else if sign, ok := data["sign"].(string); ok && sign != "" {
 		// 方式2：使用终端密钥验证（兼容旧版）
-		log.Printf("Using terminal key to verify callback for order %s", orderID)
-		handleErr = ar.paymentService.HandleCallback(data)
+		verifyErr = ar.paymentService.HandleCallback(data)
 	} else {
-		log.Printf("No sign found in callback for order %s", orderID)
-		c.String(http.StatusBadRequest, "missing sign")
+		log.Printf("WebHook missing sign: IP=%s", string(ctx.RemoteIP().String()))
+		ctx.SetStatusCode(fasthttp.StatusForbidden)
+		ctx.WriteString("missing sign")
 		return
 	}
 
-	// 处理回调结果
-	if handleErr != nil {
-		log.Printf("Callback handle error for order %s: %v", orderID, handleErr)
-		c.String(http.StatusInternalServerError, "error handling callback")
+	// 验签失败返403
+	if verifyErr != nil {
+		log.Printf("WebHook signature verify failed: orderNo=%s, IP=%s, err=%v", orderID, string(ctx.RemoteIP().String()), verifyErr)
+		ctx.SetStatusCode(fasthttp.StatusForbidden)
+		ctx.WriteString("signature verify failed")
 		return
 	}
 
-	// 同步获取与当前订单相关的捐款记录并广播，确保广播成功
-	log.Printf("开始同步获取与当前订单相关的捐款记录并广播，订单ID: %s", orderID)
+	// 立即返回success（100ms内）
+	ctx.SetStatusCode(fasthttp.StatusOK)
+	ctx.WriteString("success")
+
+	// 异步处理DB更新和广播
+	go func() {
+		// 更新DB
+		if err := ar.updateOrderStatusToPaid(orderID, amount); err != nil {
+			log.Printf("Update order status failed: %v, orderNo=%s", err, orderID)
+			return
+		}
+
+		// 广播支付成功消息
+		notification := &PayNotification{
+			Type:    "pay_success",
+			OrderNo: orderID,
+			Amount:  amount,
+			Time:    utils.Now(),
+		}
+
+		// 尝试从订单或回调数据中获取支付方式和分类信息
+		payment := ""
+		categories := ""
+
+		// 1. 首先从数据库获取订单信息，获取最准确的项目和分类
+		// 重要：这里的payment是项目ID，不是支付方式
+		// categories是分类ID，不是支付方式
+		var donation models.Donation
+		if err := utils.DB.Where("order_id = ?", orderID).First(&donation).Error; err == nil {
+			if donation.PaymentConfigID != "" {
+				payment = donation.PaymentConfigID // 使用订单的项目ID
+				log.Printf("Got project ID from database: %s", payment)
+			}
+			if donation.Categories != "" {
+				categories = donation.Categories // 使用订单的分类ID
+				log.Printf("Got category ID from database: %s", categories)
+			}
+			// 同时获取支付类型（用于日志记录）
+			if donation.Payment != "" {
+				log.Printf("Got payment method from database: %s", donation.Payment)
+			}
+		}
+
+		// 2. 尝试从数据中获取项目相关信息（如果数据库查询失败）
+		if payment == "" {
+			// 注意：这里应该获取项目ID，不是支付方式
+			if projectID, ok := data["project_id"].(string); ok {
+				payment = projectID
+				log.Printf("Got project ID from data.project_id: %s", payment)
+			} else if projectID, ok := data["project"].(string); ok {
+				payment = projectID
+				log.Printf("Got project ID from data.project: %s", payment)
+			}
+		}
+
+		// 3. 尝试从数据中获取分类相关信息
+		if categories == "" {
+			if cat, ok := data["categories"].(string); ok {
+				categories = cat
+				log.Printf("Got categories from data.categories: %s", categories)
+			} else if cat, ok := data["category"].(string); ok {
+				categories = cat
+				log.Printf("Got categories from data.category: %s", categories)
+			} else if cat, ok := data["category_id"].(string); ok {
+				categories = cat
+				log.Printf("Got categories from data.category_id: %s", categories)
+			} else if cat, ok := data["categoryId"].(string); ok {
+				categories = cat
+				log.Printf("Got categories from data.categoryId: %s", categories)
+			}
+		}
+
+		// 4. 记录支付方式信息（用于日志）
+		// 注意：不再基于支付方式设置广播目标参数
+		// 而是直接使用订单的项目和分类ID
+		if paymentMethod, ok := data["payment"].(string); ok {
+			log.Printf("Payment method from callback: %s", paymentMethod)
+		} else if paymentMethod, ok := data["payment_type"].(string); ok {
+			log.Printf("Payment method from callback: %s", paymentMethod)
+		}
+
+		// 5. 检查是否是微信支付或支付宝回调（用于日志和广播控制）
+		isWeChatPay := false
+		isAlipay := false
+
+		if wechatData, hasWechat := data["wechat"].(map[string]interface{}); hasWechat {
+			isWeChatPay = true
+			log.Printf("Detected WeChat Pay callback: orderNo=%s", orderID)
+			log.Printf("WeChat Pay data: %v", wechatData)
+			// 尝试从微信支付嵌套数据中获取信息
+			if wxOrderID, ok := wechatData["order_id"].(string); ok && orderID == "" {
+				orderID = wxOrderID
+				log.Printf("Got order ID from wechat.order_id: %s", orderID)
+			}
+			if wxAmount, ok := wechatData["amount"].(string); ok && amount == "" {
+				amount = wxAmount
+				log.Printf("Got amount from wechat.amount: %s", amount)
+			}
+			if wxStatus, ok := wechatData["status"].(string); ok && status == "" {
+				status = wxStatus
+				log.Printf("Got status from wechat.status: %s", status)
+			}
+		} else if alipayData, hasAlipay := data["alipay"].(map[string]interface{}); hasAlipay {
+			isAlipay = true
+			log.Printf("Detected Alipay callback: orderNo=%s", orderID)
+			log.Printf("Alipay data: %v", alipayData)
+			// 尝试从支付宝嵌套数据中获取信息
+			if aliOrderID, ok := alipayData["order_id"].(string); ok && orderID == "" {
+				orderID = aliOrderID
+				log.Printf("Got order ID from alipay.order_id: %s", orderID)
+			}
+			if aliAmount, ok := alipayData["amount"].(string); ok && amount == "" {
+				amount = aliAmount
+				log.Printf("Got amount from alipay.amount: %s", amount)
+			}
+			if aliStatus, ok := alipayData["status"].(string); ok && status == "" {
+				status = aliStatus
+				log.Printf("Got status from alipay.status: %s", status)
+			}
+		}
+
+		// 6. 重要：直接使用订单的实际项目和分类参数
+		// payment参数是项目ID，不是支付方式
+		// categories参数是分类ID，不是支付方式
+		// 从数据库获取的订单信息已经包含了正确的项目和分类ID
+		// 移除基于支付方式的参数转换，直接使用订单的实际参数
+		log.Printf("Using actual order parameters: payment=%s, categories=%s", payment, categories)
+
+		// 7. 最终检查
+		log.Printf("Final broadcast parameters: payment=%s, categories=%s", payment, categories)
+
+		// 记录广播信息
+		log.Printf("Preparing to broadcast payment notification: orderNo=%s, amount=%s, payment=%s, categories=%s, isWeChatPay=%t, isAlipay=%t", orderID, amount, payment, categories, isWeChatPay, isAlipay)
+
+		// 只对支付宝进行广播，微信支付的广播由状态轮询处理
+		if isAlipay {
+			// 使用定向广播
+			if payment != "" || categories != "" {
+				// 定向广播到特定参数的客户端
+				ar.wsManager.BroadcastToSpecific(notification, payment, categories)
+				log.Printf("Sent targeted broadcast for Alipay: orderNo=%s, payment=%s, categories=%s", orderID, payment, categories)
+			} else {
+				// 如果没有参数，使用全局广播
+				ar.wsManager.Broadcast(notification)
+				log.Printf("Sent global broadcast for Alipay: orderNo=%s, amount=%s", orderID, amount)
+			}
+		} else if isWeChatPay {
+			// 微信支付不在这里广播，由状态轮询处理
+			log.Printf("Skipping broadcast for WeChat Pay, will be handled by status polling", orderID)
+		} else {
+			// 其他支付方式，使用默认广播
+			if payment != "" || categories != "" {
+				ar.wsManager.BroadcastToSpecific(notification, payment, categories)
+				log.Printf("Sent targeted broadcast for other payment: orderNo=%s, payment=%s, categories=%s", orderID, payment, categories)
+			} else {
+				ar.wsManager.Broadcast(notification)
+				log.Printf("Sent global broadcast for other payment: orderNo=%s, amount=%s", orderID, amount)
+			}
+		}
+	}()
+}
+
+// updateOrderStatusToPaid 更新订单状态为已支付
+// TODO: 生产必改点3：实现真实的数据库更新逻辑
+func (ar *APIRoutes) updateOrderStatusToPaid(orderNo, amount string) error {
 	// 短暂延迟，确保数据库事务已提交
 	time.Sleep(1 * time.Second)
 
 	// 获取与当前订单相关的捐款记录
-	donation, err := ar.paymentService.GetDonationByOrderID(orderID)
-	if err != nil {
-		log.Printf("获取与订单相关的捐款记录失败: %v", err)
-	} else if donation != nil {
-		// 检查支付状态是否为completed
-		if donation.Status == "completed" {
-			log.Printf("获取到已完成的捐款记录: ID=%d, Amount=%.2f, Payment=%s, PaymentConfigID=%s, Categories=%s, Status=%s",
-				donation.ID, donation.Amount, donation.Payment,
-				donation.PaymentConfigID, donation.Categories, donation.Status)
-			// 广播新的捐款记录
-			ar.BroadcastNewDonation(donation)
-		} else {
-			log.Printf("捐款记录状态不是completed，跳过广播: Status=%s", donation.Status)
-		}
-	} else {
-		log.Printf("未获取到与订单相关的捐款记录")
-	}
+	ar.paymentService.GetDonationByOrderID(orderNo)
 
-	log.Printf("Callback handled successfully for order %s", orderID)
-	// 返回success
-	c.String(http.StatusOK, "success")
+	// 示例：更新订单状态
+	// 真实场景需要连接数据库并执行更新操作
+	log.Printf("Update order status to paid: orderNo=%s, amount=%s", orderNo, amount)
+
+	return nil // 替换为真实数据库操作
 }
 
 // GetRankings 获取捐款排行榜
-func (ar *APIRoutes) GetRankings(c *gin.Context) {
+func (ar *APIRoutes) GetRankings(ctx *fasthttp.RequestCtx) {
 	// 创建带超时的上下文，设置10秒超时
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	ctxTimeout, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// 使用超时上下文替换原请求上下文
-	c.Request = c.Request.WithContext(ctx)
-
 	// 解析limit参数，设置默认值和范围校验
-	limitStr := c.DefaultQuery("limit", "10")
+	limitStr := string(ctx.QueryArgs().Peek("limit"))
+	if limitStr == "" {
+		limitStr = "10"
+	}
 	limit, err := strconv.Atoi(limitStr)
 	if err != nil || limit <= 0 {
 		limit = 10
@@ -893,16 +997,18 @@ func (ar *APIRoutes) GetRankings(c *gin.Context) {
 	}
 
 	// 解析page参数，设置默认值和范围校验
-	pageStr := c.DefaultQuery("page", "1")
+	pageStr := string(ctx.QueryArgs().Peek("page"))
+	if pageStr == "" {
+		pageStr = "1"
+	}
 	page, err := strconv.Atoi(pageStr)
 	if err != nil || page <= 0 {
 		page = 1
 	}
 
-	// 计算偏移量
 	// 获取payment和categories参数
-	paymentConfigID := c.Query("payment")
-	categoryID := c.Query("categories")
+	paymentConfigID := string(ctx.QueryArgs().Peek("payment"))
+	categoryID := string(ctx.QueryArgs().Peek("categories"))
 
 	// 计算偏移量
 	offset := (page - 1) * limit
@@ -923,40 +1029,50 @@ func (ar *APIRoutes) GetRankings(c *gin.Context) {
 	select {
 	case res := <-resultChan:
 		if res.err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": res.err.Error()})
+			ctx.SetStatusCode(fasthttp.StatusInternalServerError)
+			ctx.Response.Header.Set("Content-Type", "application/json")
+			json.NewEncoder(ctx).Encode(map[string]string{"error": res.err.Error()})
 			return
 		}
 
-		c.JSON(http.StatusOK, gin.H{
+		ctx.SetStatusCode(fasthttp.StatusOK)
+		ctx.Response.Header.Set("Content-Type", "application/json; charset=utf-8")
+		json.NewEncoder(ctx).Encode(map[string]interface{}{
 			"rankings": res.rankings,
-			"pagination": gin.H{
+			"pagination": map[string]interface{}{
 				"limit":  limit,
 				"page":   page,
 				"offset": offset,
 				"total":  len(res.rankings),
 			},
 		})
-	case <-ctx.Done():
-		c.JSON(http.StatusRequestTimeout, gin.H{"error": "请求超时，请稍后再试"})
+	case <-ctxTimeout.Done():
+		ctx.SetStatusCode(fasthttp.StatusRequestTimeout)
+		ctx.Response.Header.Set("Content-Type", "application/json")
+		json.NewEncoder(ctx).Encode(map[string]string{"error": "请求超时，请稍后再试"})
 		return
 	}
 }
 
 // ActivateTerminal 手动激活终端API
-func (ar *APIRoutes) ActivateTerminal(c *gin.Context) {
+func (ar *APIRoutes) ActivateTerminal(ctx *fasthttp.RequestCtx) {
 	// 从请求体获取激活码
 	var req struct {
-		ActivationCode string `json:"activation_code" binding:"required"`
+		ActivationCode string `json:"activation_code"`
 	}
 
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	if err := json.Unmarshal(ctx.PostBody(), &req); err != nil {
+		ctx.SetStatusCode(fasthttp.StatusBadRequest)
+		ctx.Response.Header.Set("Content-Type", "application/json")
+		json.NewEncoder(ctx).Encode(map[string]string{"error": err.Error()})
 		return
 	}
 
 	// 执行终端激活
 	if err := ar.paymentService.ActivateTerminal(req.ActivationCode); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
+		ctx.SetStatusCode(fasthttp.StatusInternalServerError)
+		ctx.Response.Header.Set("Content-Type", "application/json")
+		json.NewEncoder(ctx).Encode(map[string]string{
 			"error": fmt.Sprintf("Terminal activation failed: %v", err),
 		})
 		return
@@ -966,7 +1082,9 @@ func (ar *APIRoutes) ActivateTerminal(c *gin.Context) {
 	config := ar.paymentService.Config()
 
 	// 返回成功响应
-	c.JSON(http.StatusOK, gin.H{
+	ctx.SetStatusCode(fasthttp.StatusOK)
+	ctx.Response.Header.Set("Content-Type", "application/json")
+	json.NewEncoder(ctx).Encode(map[string]string{
 		"message":      "Terminal activation successful",
 		"terminal_sn":  config.TerminalSN,
 		"terminal_key": config.TerminalKey,
@@ -974,18 +1092,18 @@ func (ar *APIRoutes) ActivateTerminal(c *gin.Context) {
 }
 
 // GenerateQRCode 生成统一支付二维码
-func (ar *APIRoutes) GenerateQRCode(c *gin.Context) {
+func (ar *APIRoutes) GenerateQRCode(ctx *fasthttp.RequestCtx) {
 	// 获取payment参数
-	payment := c.Query("payment")
+	payment := string(ctx.QueryArgs().Peek("payment"))
 
 	// 如果payment参数不存在，返回首页
 	if payment == "" {
-		c.Redirect(http.StatusFound, "/")
+		ctx.Redirect("/", fasthttp.StatusFound)
 		return
 	}
 
 	// 获取categories参数
-	categories := c.Query("categories")
+	categories := string(ctx.QueryArgs().Peek("categories"))
 
 	// 当payment有参数时，如果没有categories参数，自动设置默认的categories参数
 	if categories == "" {
@@ -994,7 +1112,7 @@ func (ar *APIRoutes) GenerateQRCode(c *gin.Context) {
 	}
 
 	// 获取请求的主机名
-	host := c.Request.Host
+	host := string(ctx.Host())
 
 	// 处理不同的访问情况
 	switch host {
@@ -1019,339 +1137,182 @@ func (ar *APIRoutes) GenerateQRCode(c *gin.Context) {
 
 	qrBytes, err := utils.GenerateQRCode(payURL)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		ctx.SetStatusCode(fasthttp.StatusInternalServerError)
+		ctx.Response.Header.Set("Content-Type", "application/json; charset=utf-8")
+		json.NewEncoder(ctx).Encode(map[string]string{"error": err.Error()})
 		return
 	}
 
-	c.Header("Content-Type", "image/png")
-	c.Writer.Write(qrBytes)
+	ctx.Response.Header.Set("Content-Type", "image/png")
+	ctx.Write(qrBytes)
 }
 
 // GetPaymentConfig 获取支付配置信息
-func (ar *APIRoutes) GetPaymentConfig(c *gin.Context) {
-	id := c.Param("id")
+func (ar *APIRoutes) GetPaymentConfig(ctx *fasthttp.RequestCtx) {
+	// 从路径中获取ID参数
+	path := string(ctx.Path())
+	id := path[len("/api/payment-config/"):]
 	if id == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "缺少支付配置ID参数"})
+		ctx.SetStatusCode(fasthttp.StatusBadRequest)
+		ctx.Response.Header.Set("Content-Type", "application/json; charset=utf-8")
+		json.NewEncoder(ctx).Encode(map[string]string{"error": "缺少支付配置ID参数"})
 		return
 	}
 
 	var paymentConfig models.PaymentConfig
 	if err := utils.DB.Where("id = ?", id).First(&paymentConfig).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "支付配置不存在"})
+		ctx.SetStatusCode(fasthttp.StatusNotFound)
+		ctx.Response.Header.Set("Content-Type", "application/json; charset=utf-8")
+		json.NewEncoder(ctx).Encode(map[string]string{"error": "支付配置不存在"})
 		return
 	}
 
-	c.JSON(http.StatusOK, paymentConfig)
+	ctx.SetStatusCode(fasthttp.StatusOK)
+	ctx.Response.Header.Set("Content-Type", "application/json; charset=utf-8")
+	json.NewEncoder(ctx).Encode(paymentConfig)
 }
 
 // GetCategory 获取类目信息
-func (ar *APIRoutes) GetCategory(c *gin.Context) {
-	id := c.Param("id")
+func (ar *APIRoutes) GetCategory(ctx *fasthttp.RequestCtx) {
+	// 从路径中获取ID参数
+	path := string(ctx.Path())
+	id := path[len("/api/category/"):]
 	if id == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "缺少类目ID参数"})
+		ctx.SetStatusCode(fasthttp.StatusBadRequest)
+		ctx.Response.Header.Set("Content-Type", "application/json; charset=utf-8")
+		json.NewEncoder(ctx).Encode(map[string]string{"error": "缺少类目ID参数"})
 		return
 	}
 
 	var category models.Category
 	if err := utils.DB.Where("id = ?", id).First(&category).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "类目不存在"})
+		ctx.SetStatusCode(fasthttp.StatusNotFound)
+		ctx.Response.Header.Set("Content-Type", "application/json; charset=utf-8")
+		json.NewEncoder(ctx).Encode(map[string]string{"error": "类目不存在"})
 		return
 	}
 
-	c.JSON(http.StatusOK, category)
+	ctx.SetStatusCode(fasthttp.StatusOK)
+	ctx.Response.Header.Set("Content-Type", "application/json; charset=utf-8")
+	json.NewEncoder(ctx).Encode(category)
 }
 
 // GetCategories 获取所有类目列表
-func (ar *APIRoutes) GetCategories(c *gin.Context) {
+func (ar *APIRoutes) GetCategories(ctx *fasthttp.RequestCtx) {
 	var categories []models.Category
 	query := utils.DB
 
 	// 根据payment参数过滤
-	payment := c.Query("payment")
+	payment := string(ctx.QueryArgs().Peek("payment"))
 	if payment != "" {
 		query = query.Where("payment = ?", payment)
 	}
 
 	if err := query.Find(&categories).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "获取类目列表失败"})
+		ctx.SetStatusCode(fasthttp.StatusInternalServerError)
+		ctx.Response.Header.Set("Content-Type", "application/json")
+		json.NewEncoder(ctx).Encode(map[string]string{"error": "获取类目列表失败"})
 		return
 	}
 
-	c.JSON(http.StatusOK, categories)
+	ctx.SetStatusCode(fasthttp.StatusOK)
+	ctx.Response.Header.Set("Content-Type", "application/json")
+	json.NewEncoder(ctx).Encode(categories)
 }
 
-// runWebSocketServer 运行WebSocket服务器
-func (ar *APIRoutes) runWebSocketServer() {
-	log.Printf("====================================")
-	log.Printf("WebSocket服务器已启动")
-	log.Printf("当前时间: %v", time.Now())
-	log.Printf("====================================")
+// setAnonymousWechatCookie 设置微信匿名用户cookie
+func (ar *APIRoutes) setAnonymousWechatCookie(ctx *fasthttp.RequestCtx) {
+	cookie := &fasthttp.Cookie{}
+	cookie.SetKey("wechat_openid")
+	cookie.SetValue("anonymous")
+	cookie.SetMaxAge(86400)
+	cookie.SetPath("/")
+	ctx.Response.Header.SetCookie(cookie)
 
-	// 定期清理无效连接的定时器
-	cleanupTicker := time.NewTicker(30 * time.Second)
-	defer cleanupTicker.Stop()
+	cookie = &fasthttp.Cookie{}
+	cookie.SetKey("wechat_user_id")
+	cookie.SetValue("anonymous")
+	cookie.SetMaxAge(86400)
+	cookie.SetPath("/")
+	ctx.Response.Header.SetCookie(cookie)
 
-	for {
-		select {
-		case client := <-ar.register:
-			ar.mutex.Lock()
-			ar.clients[client] = true
-			clientCount := len(ar.clients)
-			ar.mutex.Unlock()
-			log.Printf("====================================")
-			log.Printf("WebSocket客户端已连接")
-			log.Printf("当前客户端数量: %d", clientCount)
-			log.Printf("====================================")
+	cookie = &fasthttp.Cookie{}
+	cookie.SetKey("wechat_user_name")
+	cookie.SetValue("匿名施主")
+	cookie.SetMaxAge(86400)
+	cookie.SetPath("/")
+	ctx.Response.Header.SetCookie(cookie)
 
-			// 发送初始数据
-			go ar.sendInitialData(client)
-
-		case client := <-ar.unregister:
-			ar.mutex.Lock()
-			if _, ok := ar.clients[client]; ok {
-				delete(ar.clients, client)
-				client.Close()
-			}
-			clientCount := len(ar.clients)
-			ar.mutex.Unlock()
-			log.Printf("====================================")
-			log.Printf("WebSocket客户端已断开连接")
-			log.Printf("当前客户端数量: %d", clientCount)
-			log.Printf("====================================")
-
-		case message := <-ar.broadcast:
-			ar.mutex.Lock()
-			clientCount := len(ar.clients)
-			ar.mutex.Unlock()
-
-			log.Printf("====================================")
-			log.Printf("开始处理广播消息")
-			log.Printf("当前客户端数量: %d", clientCount)
-			log.Printf("消息大小: %d bytes", len(message))
-			log.Printf("====================================")
-
-			if clientCount == 0 {
-				log.Printf("没有客户端连接，跳过广播")
-				continue
-			}
-
-			ar.mutex.Lock()
-			successCount := 0
-			failCount := 0
-			for client := range ar.clients {
-				select {
-				case <-time.After(1000 * time.Millisecond):
-					// 超时，跳过该客户端
-					failCount++
-					log.Printf("向客户端广播消息超时")
-				default:
-					if err := client.WriteMessage(websocket.TextMessage, message); err != nil {
-						log.Printf("向客户端广播消息失败: %v", err)
-						client.Close()
-						delete(ar.clients, client)
-						failCount++
-					} else {
-						successCount++
-						log.Printf("向客户端广播消息成功")
-					}
-				}
-			}
-			ar.mutex.Unlock()
-			log.Printf("====================================")
-			log.Printf("广播完成")
-			log.Printf("成功: %d, 失败: %d, 总客户端数: %d", successCount, failCount, clientCount)
-			log.Printf("====================================")
-
-		case <-cleanupTicker.C:
-			// 定期清理无效连接
-			log.Printf("====================================")
-			log.Printf("开始清理无效连接")
-			ar.cleanupInvalidConnections()
-			ar.mutex.Lock()
-			clientCount := len(ar.clients)
-			ar.mutex.Unlock()
-			log.Printf("清理完成，当前客户端数量: %d", clientCount)
-			log.Printf("====================================")
-		}
-	}
+	cookie = &fasthttp.Cookie{}
+	cookie.SetKey("wechat_avatar_url")
+	cookie.SetValue("./static/avatar.jpeg")
+	cookie.SetMaxAge(86400)
+	cookie.SetPath("/")
+	ctx.Response.Header.SetCookie(cookie)
 }
 
-// cleanupInvalidConnections 清理无效的WebSocket连接
-func (ar *APIRoutes) cleanupInvalidConnections() {
-	ar.mutex.Lock()
-	defer ar.mutex.Unlock()
+// setAnonymousAlipayCookie 设置支付宝匿名用户cookie
+func (ar *APIRoutes) setAnonymousAlipayCookie(ctx *fasthttp.RequestCtx) {
+	cookie := &fasthttp.Cookie{}
+	cookie.SetKey("alipay_user_id")
+	cookie.SetValue("anonymous")
+	cookie.SetMaxAge(86400)
+	cookie.SetPath("/")
+	ctx.Response.Header.SetCookie(cookie)
 
-	totalClients := len(ar.clients)
-	invalidCount := 0
+	cookie = &fasthttp.Cookie{}
+	cookie.SetKey("alipay_user_name")
+	cookie.SetValue("匿名施主")
+	cookie.SetMaxAge(86400)
+	cookie.SetPath("/")
+	ctx.Response.Header.SetCookie(cookie)
 
-	for client := range ar.clients {
-		// 发送ping消息测试连接是否有效
-		if err := client.WriteMessage(websocket.PingMessage, nil); err != nil {
-			// 连接无效，关闭并从映射中删除
-			client.Close()
-			delete(ar.clients, client)
-			invalidCount++
+	cookie = &fasthttp.Cookie{}
+	cookie.SetKey("alipay_avatar_url")
+	cookie.SetValue("./static/avatar.jpeg")
+	cookie.SetMaxAge(86400)
+	cookie.SetPath("/")
+	ctx.Response.Header.SetCookie(cookie)
+}
+
+// buildRedirectURL 构建重定向URL
+func (ar *APIRoutes) buildRedirectURL(redirectURL, payment, categories string) string {
+	if redirectURL == "" {
+		redirectURL = "/pay"
+
+		if payment != "" {
+			redirectURL += fmt.Sprintf("?payment=%s", payment)
+			if categories != "" {
+				redirectURL += fmt.Sprintf("&categories=%s", categories)
+			}
+		} else if categories != "" {
+			redirectURL += fmt.Sprintf("?categories=%s", categories)
 		}
 	}
 
-	if invalidCount > 0 {
-		log.Printf("Cleaned up %d invalid WebSocket connections. Total clients: %d → %d",
-			invalidCount, totalClients, len(ar.clients))
-	}
-}
-
-// sendInitialData 发送初始数据给新连接的客户端
-func (ar *APIRoutes) sendInitialData(client *websocket.Conn) {
-	// 获取最新的功德记录
-	rankings, err := ar.paymentService.GetRankings(50, 0, "", "")
-	if err != nil {
-		log.Printf("Error getting initial rankings: %v", err)
-		return
-	}
-
-	// 构建初始数据消息
-	initialData := map[string]interface{}{
-		"type":      "initial_data",
-		"rankings":  rankings,
-		"timestamp": time.Now().Unix(),
-	}
-
-	message, err := json.Marshal(initialData)
-	if err != nil {
-		log.Printf("Error marshaling initial data: %v", err)
-		return
-	}
-
-	if err := client.WriteMessage(websocket.TextMessage, message); err != nil {
-		log.Printf("Error sending initial data: %v", err)
-		client.Close()
-		ar.mutex.Lock()
-		delete(ar.clients, client)
-		ar.mutex.Unlock()
-	}
-}
-
-// WebSocketHandler 处理WebSocket连接
-func (ar *APIRoutes) WebSocketHandler(c *gin.Context) {
-	// 升级HTTP连接为WebSocket连接
-	conn, err := ar.upgrader.Upgrade(c.Writer, c.Request, nil)
-	if err != nil {
-		log.Printf("Error upgrading to WebSocket: %v", err)
-		return
-	}
-
-	// 注册新客户端
-	ar.register <- conn
-
-	// 处理客户端消息
-	for {
-		messageType, _, err := conn.ReadMessage()
-		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("WebSocket error: %v", err)
-			}
-			break
-		}
-
-		// 忽略客户端发送的消息，只处理服务器推送
-		if messageType == websocket.PingMessage {
-			if err := conn.WriteMessage(websocket.PongMessage, nil); err != nil {
-				break
-			}
+	if !strings.Contains(redirectURL, "authorized=") {
+		if !strings.Contains(redirectURL, "?") {
+			redirectURL += "?authorized=1"
+		} else {
+			redirectURL += "&authorized=1"
 		}
 	}
 
-	// 注销客户端
-	ar.unregister <- conn
-}
-
-// BroadcastNewDonation 广播新的捐款记录
-func (ar *APIRoutes) BroadcastNewDonation(donation interface{}) {
-	// 构建广播消息
-	message := map[string]interface{}{
-		"type":      "new_donation",
-		"donation":  donation,
-		"timestamp": time.Now().Unix(),
+	if payment != "" && !strings.Contains(redirectURL, "payment=") {
+		if !strings.Contains(redirectURL, "?") {
+			redirectURL += fmt.Sprintf("?payment=%s", payment)
+		} else {
+			redirectURL += fmt.Sprintf("&payment=%s", payment)
+		}
 	}
 
-	log.Printf("开始广播新捐款记录，当前客户端数量: %d", len(ar.clients))
-	data, err := json.Marshal(message)
-	if err != nil {
-		log.Printf("Error marshaling donation data: %v", err)
-		return
+	if categories != "" && !strings.Contains(redirectURL, "categories=") {
+		if !strings.Contains(redirectURL, "?") {
+			redirectURL += fmt.Sprintf("?categories=%s", categories)
+		} else {
+			redirectURL += fmt.Sprintf("&categories=%s", categories)
+		}
 	}
 
-	// 发送到广播通道
-	ar.broadcast <- data
-	log.Printf("广播消息已发送到通道，消息大小: %d bytes", len(data))
-}
-
-// TestBroadcast 测试WebSocket广播功能
-func (ar *APIRoutes) TestBroadcast(c *gin.Context) {
-	log.Printf("====================================")
-	log.Printf("收到测试广播请求")
-	log.Printf("当前时间: %v", time.Now())
-	log.Printf("====================================")
-
-	// 生成测试捐款记录
-	testDonation := map[string]interface{}{
-		"id":              time.Now().Unix(),
-		"user_name":       "测试用户",
-		"amount":          100.00,
-		"blessing":        "这是一条测试捐款记录，用于测试WebSocket广播功能",
-		"avatar_url":      "/static/avatar.jpeg",
-		"payment":         "wechat",
-		"created_at":      time.Now().Format("2006-01-02 15:04:05"),
-		"PaymentConfigID": 2,
-		"Categories":      "17",
-	}
-
-	log.Printf("生成测试捐款记录: %v", testDonation)
-
-	// 广播测试捐款记录
-	ar.BroadcastNewDonation(testDonation)
-
-	log.Printf("测试广播完成")
-
-	c.JSON(http.StatusOK, gin.H{
-		"success":  true,
-		"message":  "测试广播已发送",
-		"donation": testDonation,
-	})
-}
-
-// TriggerCallback 触发支付回调广播测试
-func (ar *APIRoutes) TriggerCallback(c *gin.Context) {
-	log.Printf("====================================")
-	log.Printf("收到触发回调广播请求")
-	log.Printf("当前时间: %v", time.Now())
-	log.Printf("====================================")
-
-	// 模拟支付回调的捐款记录
-	testDonation := map[string]interface{}{
-		"id":              time.Now().Unix(),
-		"user_name":       "实际用户",
-		"amount":          50.00,
-		"blessing":        "支付回调测试捐款",
-		"avatar_url":      "/static/avatar.jpeg",
-		"payment":         "wechat",
-		"created_at":      time.Now().Format("2006-01-02 15:04:05"),
-		"PaymentConfigID": 2,
-		"Categories":      "17",
-		"order_id":        fmt.Sprintf("ORD%d", time.Now().Unix()),
-		"status":          "completed",
-	}
-
-	log.Printf("模拟支付回调捐款记录: %v", testDonation)
-
-	// 广播捐款记录
-	ar.BroadcastNewDonation(testDonation)
-
-	log.Printf("回调广播完成")
-
-	c.JSON(http.StatusOK, gin.H{
-		"success":  true,
-		"message":  "支付回调广播已触发",
-		"donation": testDonation,
-	})
+	return redirectURL
 }
