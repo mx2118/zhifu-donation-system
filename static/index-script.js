@@ -1144,12 +1144,12 @@ function initModal() {
 
 // HTTP轮询管理
 let pollingInterval;
-let currentPollingInterval = 5000; // 当前轮询间隔（毫秒）
-const minPollingInterval = 3000; // 最小轮询间隔（毫秒）
-const maxPollingInterval = 15000; // 最大轮询间隔（毫秒）
-const defaultPollingInterval = 5000; // 默认轮询间隔（毫秒）
-const pollingBackoffFactor = 1.5; // 轮询间隔增加因子
-const pollingRecoveryFactor = 0.8; // 轮询间隔减少因子
+let currentPollingInterval = 2000; // 当前轮询间隔（毫秒）
+const minPollingInterval = 1000; // 最小轮询间隔（毫秒）
+const maxPollingInterval = 5000; // 最大轮询间隔（毫秒）
+const defaultPollingInterval = 2000; // 默认轮询间隔（毫秒）
+const pollingBackoffFactor = 1.2; // 轮询间隔增加因子
+const pollingRecoveryFactor = 0.9; // 轮询间隔减少因子
 // lastDonationTime 已在文件顶部初始化
 
 // 启动HTTP轮询

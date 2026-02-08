@@ -1068,17 +1068,6 @@ func (ar *APIRoutes) GetRankings(ctx *fasthttp.RequestCtx) {
 	// 计算偏移量
 	offset := (page - 1) * limit
 
-	// 构建缓存键
-	cacheKey := fmt.Sprintf("rankings:%d:%d:%s:%s", limit, offset, paymentConfigID, categoryID)
-
-	// 尝试从缓存获取
-	if cachedData, found := utils.Cache.Get(cacheKey); found {
-		ctx.SetStatusCode(fasthttp.StatusOK)
-		ctx.Response.Header.Set("Content-Type", "application/json; charset=utf-8")
-		json.NewEncoder(ctx).Encode(cachedData)
-		return
-	}
-
 	// 使用goroutine和channel处理超时
 	type result struct {
 		rankings []services.RankingItem
@@ -1111,9 +1100,6 @@ func (ar *APIRoutes) GetRankings(ctx *fasthttp.RequestCtx) {
 				"total":  len(res.rankings),
 			},
 		}
-
-		// 缓存响应数据，有效期10秒
-		utils.Cache.Set(cacheKey, responseData, 10*time.Second)
 
 		ctx.SetStatusCode(fasthttp.StatusOK)
 		ctx.Response.Header.Set("Content-Type", "application/json; charset=utf-8")
